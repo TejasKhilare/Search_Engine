@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+backend/.env
+docker/.env
+
+# Storage / uploads
+backend/storage/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker volumes / local data
+postgres_data/
+qdrant_data/
+
+# Node (future frontend)
+node_modules/
+dist/
