@@ -1,7 +1,7 @@
 from typing import List, Dict
 
 
-def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50) -> List[Dict]:
+def chunk_text(text: str, chunk_size: int = 250, overlap: int = 50) -> List[Dict]:
     """
     Splits text into overlapping word-level chunks.
     Returns list of {"chunk_id", "content", "start_pos", "end_pos"}

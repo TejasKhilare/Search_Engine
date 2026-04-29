@@ -2,20 +2,22 @@ import os
 import logging
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
-
+from core.deps import get_current_user
 from db.postgres import get_db
-from db.models import Document
+from db.models import Document, User
 from utils.file_utils import validate_file, generate_doc_id, get_file_path
 from services.ingestion_service import process_document
 
 logger = logging.getLogger(__name__)
-router = APIRouter()  
+router = APIRouter(prefix="/api", tags=["documents"])
+
 
 @router.post("/upload")
 async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     file_path = None
     try:
@@ -40,6 +42,7 @@ async def upload_file(
             file_type=ext,
             path=file_path,
             status="pending",
+            user_id=user.id,
         )
         db.add(document)
         db.commit()
@@ -65,9 +68,19 @@ async def upload_file(
         logger.error(f"Upload failed: {e}")
         raise HTTPException(status_code=500, detail="Upload failed")
 
+
+#added get_current_user dependency + ownership check
 @router.get("/document/{doc_id}/status")
-def get_document_status(doc_id: str, db: Session = Depends(get_db)):
-    document = db.query(Document).filter(Document.doc_id == doc_id).first()
+def get_document_status(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    document = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id == user.id, 
+    ).first()
+
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 

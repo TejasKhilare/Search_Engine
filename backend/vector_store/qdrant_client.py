@@ -1,3 +1,4 @@
+import uuid
 import logging
 from typing import List, Dict, Optional, cast
 
@@ -35,7 +36,7 @@ def ensure_collection():
     existing = [c.name for c in client.get_collections().collections]
 
     if COLLECTION not in existing:
-        client.create_collection(  # type: ignore[attr-defined]
+        client.create_collection(
             collection_name=COLLECTION,
             vectors_config=VectorParams(
                 size=DIM,
@@ -50,13 +51,15 @@ def ensure_collection():
 def upsert_vectors(points: List[Dict]):
     """
     Batch upsert chunk vectors into Qdrant.
+    Point IDs are stored as UUID strings and converted to uuid.UUID objects
+    for the Qdrant client so that rollback lookups work correctly.
     """
     if not points:
         return
 
     qdrant_points = [
         PointStruct(
-            id=p["id"],
+            id=uuid.UUID(p["id"]),
             vector=p["vector"],
             payload=p["payload"],
         )
@@ -66,9 +69,8 @@ def upsert_vectors(points: List[Dict]):
     batch_size = 100
 
     for i in range(0, len(qdrant_points), batch_size):
-        batch = qdrant_points[i: i + batch_size]
-
-        client.upsert(  # type: ignore[attr-defined]
+        batch = qdrant_points[i : i + batch_size]
+        client.upsert(
             collection_name=COLLECTION,
             points=batch,
         )
@@ -76,16 +78,16 @@ def upsert_vectors(points: List[Dict]):
 
 def delete_vectors_by_ids(vector_ids: List[str]):
     """
-    Delete specific vectors by their point IDs.
-    Used for rollback if Postgres save fails.
+    Delete specific vectors by their UUID string point IDs.
+    Used for rollback if Postgres save fails after Qdrant upsert.
     """
     if not vector_ids:
         return
 
     try:
-        typed_ids = cast(List[ExtendedPointId], vector_ids)
+        typed_ids: List[ExtendedPointId] = [uuid.UUID(vid) for vid in vector_ids]
 
-        client.delete(  # type: ignore[attr-defined]
+        client.delete(
             collection_name=COLLECTION,
             points_selector=PointIdsList(points=typed_ids),
         )
@@ -102,7 +104,7 @@ def delete_document_vectors(doc_id: str):
     Useful when deleting a document.
     """
     try:
-        client.delete(  # type: ignore[attr-defined]
+        client.delete(
             collection_name=COLLECTION,
             points_selector=Filter(
                 must=[
@@ -141,7 +143,7 @@ def search_vectors(
             ]
         )
 
-    response = client.query_points(  # type: ignore[attr-defined]
+    response = client.query_points(
         collection_name=COLLECTION,
         query=query_vector,
         query_filter=query_filter,

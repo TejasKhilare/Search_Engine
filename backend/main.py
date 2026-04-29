@@ -4,6 +4,9 @@ from db.postgres import Base, engine
 import db.models  # ensures all models are registered before create_all
 from api.routes_upload import router as upload_router
 from api.routes_search import router as search_router
+from api.routes_rag import router as rag_router
+from api.routes_auth import router as auth_router
+from api.routes_documents import router as documents_router
 from vector_store.qdrant_client import ensure_collection
 import logging
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,20 +35,20 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000",
-                   "http://localhost:5173"],
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(upload_router, prefix="/api", tags=["upload"])
-app.include_router(search_router, prefix="/api", tags=["search"])
-from api.routes_documents import router as documents_router
+app.include_router(upload_router)
+app.include_router(search_router)
+app.include_router(rag_router)
+app.include_router(auth_router)
 app.include_router(documents_router)
-
 
 
 @app.get("/")

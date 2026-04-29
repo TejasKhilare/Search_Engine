@@ -4,14 +4,19 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from db.postgres import get_db
-from db.models import Document, Chunk
+from db.models import Document, Chunk ,User
+from core.deps import get_current_user
 from vector_store.qdrant_client import delete_document_vectors
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
 @router.get("/documents")
-def list_documents(db: Session = Depends(get_db)):
-    docs = db.query(Document).order_by(Document.created_at.desc()).all()
+def list_documents(
+    user:User=Depends(get_current_user),
+    db: Session = Depends(get_db)):
+    docs = db.query(Document).filter(
+        Document.user_id==user.id).order_by(
+            Document.created_at.desc()).all()
 
     return [
         {
@@ -25,8 +30,13 @@ def list_documents(db: Session = Depends(get_db)):
     ]
 
 @router.get("/documents/{doc_id}/view")
-def view_document(doc_id: str, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.doc_id == doc_id).first()
+def view_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user:User=Depends(get_current_user)):
+    doc = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id==user.id).first()
 
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -43,8 +53,11 @@ def view_document(doc_id: str, db: Session = Depends(get_db)):
     )
 
 @router.delete("/documents/{doc_id}")
-def delete_document(doc_id: str, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.doc_id == doc_id).first()
+def delete_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user:User=Depends(get_current_user)):
+    doc = db.query(Document).filter(Document.doc_id == doc_id,Document.user_id == user.id).first()
 
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")

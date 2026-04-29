@@ -1,12 +1,13 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, Index, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, Index,ForeignKey, UniqueConstraint
 from datetime import datetime, timezone
 from db.postgres import Base
-
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 
 class Document(Base):
     __tablename__ = "documents"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True,default=uuid.uuid4)
     doc_id = Column(String, unique=True, index=True, nullable=False)
     filename = Column(String, nullable=False)
     file_type = Column(String, nullable=False)
@@ -14,6 +15,7 @@ class Document(Base):
     status = Column(String, default="pending")  # pending | processing | completed | failed
     total_chunks = Column(Integer, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    user_id=Column(UUID(as_uuid=True),ForeignKey("users.id",ondelete='CASCADE'),nullable=False,index=True)
 
 
 class Chunk(Base):
@@ -38,9 +40,9 @@ class Chunk(Base):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True)
-    username = Column(String, unique=True, nullable=True)
-    email = Column(String, unique=True, nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True,default=uuid.uuid4)
+    username = Column(String, unique=True, nullable=False,index=True)
+    email = Column(String, unique=True, nullable=False, index=True)
     password_hash = Column(String, nullable=False)
     is_verified = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -52,6 +54,11 @@ class SearchLog(Base):
     id = Column(Integer, primary_key=True)
     query = Column(String, nullable=False)
     doc_id = Column(String, nullable=True)
-    user_id = Column(Integer, nullable=True)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     results_count = Column(Integer, default=0)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))

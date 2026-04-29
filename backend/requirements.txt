@@ -11,3 +11,7 @@ Pillow
 python-multipart
 pydantic
 python-dotenv
+openai>=1.0.0
+bcrypt==4.0.1
+passlib[bcrypt]
+python-jose[cryptography]
