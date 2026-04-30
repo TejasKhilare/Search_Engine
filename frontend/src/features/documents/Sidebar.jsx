@@ -3,14 +3,49 @@ import UploadButton from "./UploadButton"
 
 export default function Sidebar() {
   return (
-    <div className="w-64 bg-gray-100 p-4 h-screen flex flex-col">
-      <h2 className="text-lg font-semibold mb-4">Documents</h2>
+    <div style={styles.sidebar}>
+      <div style={styles.header}>
+        <span style={styles.title}>Documents</span>
+      </div>
 
-      <UploadButton />
+      <div style={styles.uploadArea}>
+        <UploadButton />
+      </div>
 
-      <div className="mt-4 flex-1 overflow-y-auto">
+      <div style={styles.listArea}>
         <DocumentList />
       </div>
     </div>
   )
+}
+
+const styles = {
+  sidebar: {
+    display: "flex",
+    flexDirection: "column",
+    height: "100%",
+    background: "var(--bg-secondary)",
+    overflow: "hidden",
+  },
+  header: {
+    padding: "18px 16px 12px",
+    borderBottom: "1px solid var(--border)",
+    flexShrink: 0,
+  },
+  title: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: "var(--text-muted)",
+    letterSpacing: "0.08em",
+    textTransform: "uppercase",
+  },
+  uploadArea: {
+    padding: "12px 12px 8px",
+    flexShrink: 0,
+  },
+  listArea: {
+    flex: 1,
+    overflowY: "auto",
+    padding: "4px 8px 16px",
+  },
 }
