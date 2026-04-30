@@ -8,6 +8,7 @@ from api.routes_rag import router as rag_router
 from api.routes_auth import router as auth_router
 from api.routes_documents import router as documents_router
 from vector_store.qdrant_client import ensure_collection
+from core.config import settings
 import logging
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -16,7 +17,9 @@ logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Validate all required env vars at startup — fail fast with clear message
+    settings.validate()
+
     print("Creating Postgres tables...")
     Base.metadata.create_all(bind=engine)
     print("Tables ready")
@@ -36,12 +39,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Allow all localhost/127.0.0.1 origins across any port (Vite can be 5173,
+# 5174, 3000, etc.). In production, replace with your real domain.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 app.include_router(upload_router)
