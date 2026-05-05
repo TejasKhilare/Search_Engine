@@ -11,34 +11,14 @@ services:
     volumes:
       - ../backend:/app
     depends_on:
-      postgres:
-        condition: service_healthy
       qdrant:
         condition: service_started
     dns:
-    - 8.8.8.8
-    - 8.8.4.4
+      - 8.8.8.8
+      - 8.8.4.4
     env_file:
       - ../backend/.env
     restart: always
-
-  postgres:
-    image: postgres:15
-    container_name: postgres_db
-    restart: always
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
-      POSTGRES_DB: docdb
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d docdb"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
 
   qdrant:
     image: qdrant/qdrant
@@ -51,5 +31,4 @@ services:
       - qdrant_data:/qdrant/storage
 
 volumes:
-  postgres_data:
   qdrant_data:

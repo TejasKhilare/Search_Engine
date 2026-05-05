@@ -1,22 +1,26 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from db.postgres import get_db
-from db.models import Document, Chunk ,User
+from db.models import Document, Chunk, User
 from core.deps import get_current_user
+from core.config import settings
 from vector_store.qdrant_client import delete_document_vectors
+from utils.file_utils import delete_from_s3, generate_presigned_url
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
+
 @router.get("/documents")
 def list_documents(
-    user:User=Depends(get_current_user),
-    db: Session = Depends(get_db)):
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     docs = db.query(Document).filter(
-        Document.user_id==user.id).order_by(
-            Document.created_at.desc()).all()
+        Document.user_id == user.id
+    ).order_by(Document.created_at.desc()).all()
 
     return [
         {
@@ -29,35 +33,43 @@ def list_documents(
         for doc in docs
     ]
 
+
 @router.get("/documents/{doc_id}/view")
 def view_document(
     doc_id: str,
     db: Session = Depends(get_db),
-    user:User=Depends(get_current_user)):
+    user: User = Depends(get_current_user),
+):
     doc = db.query(Document).filter(
         Document.doc_id == doc_id,
-        Document.user_id==user.id).first()
+        Document.user_id == user.id,
+    ).first()
 
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    file_path = str(doc.path)
+    s3_key = str(doc.path)
 
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File missing on server")
-
-    return FileResponse(
-        path=file_path,
-        filename=str(doc.filename),
-        media_type="application/pdf"
+    # Generate a presigned URL and redirect the browser to it
+    url = generate_presigned_url(
+        s3_key=s3_key,
+        bucket=settings.S3_BUCKET_NAME,
+        region=settings.AWS_REGION,
+        expires=3600,
     )
+    return RedirectResponse(url=url)
+
 
 @router.delete("/documents/{doc_id}")
 def delete_document(
     doc_id: str,
     db: Session = Depends(get_db),
-    user:User=Depends(get_current_user)):
-    doc = db.query(Document).filter(Document.doc_id == doc_id,Document.user_id == user.id).first()
+    user: User = Depends(get_current_user),
+):
+    doc = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id == user.id,
+    ).first()
 
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -66,12 +78,16 @@ def delete_document(
         db.query(Chunk).filter(Chunk.doc_id == doc_id).delete()
         delete_document_vectors(doc_id)
 
-        file_path = str(doc.path)
+        s3_key = str(doc.path)
         db.delete(doc)
         db.commit()
 
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # Delete from S3
+        delete_from_s3(
+            s3_key=s3_key,
+            bucket=settings.S3_BUCKET_NAME,
+            region=settings.AWS_REGION,
+        )
 
         return {
             "message": "Document deleted successfully",

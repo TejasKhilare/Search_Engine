@@ -42,17 +42,24 @@ app = FastAPI(
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Allow all localhost/127.0.0.1 origins across any port (Vite can be 5173,
 # 5174, 3000, etc.). In production, replace with your real domain.
+# ── CORS ──────────────────────────────────────────────────────────────────────
+allowed_origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+]
+
+# Add the S3 frontend URL from env if set (e.g. http://my-bucket.s3-website.ap-south-1.amazonaws.com)
+if settings.FRONTEND_URL:
+    allowed_origins.append(settings.FRONTEND_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
