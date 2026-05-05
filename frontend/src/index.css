@@ -1,8 +1,9 @@
+/* @import MUST come before @tailwind directives — PostCSS requirement */
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
   --bg-primary: #0f0f13;
@@ -130,4 +131,48 @@ code, pre, .mono {
 
 /* react-pdf overrides */
 .react-pdf__Page { background: transparent !important; }
-.react-pdf__Page canvas { border-radius: 8px; box-shadow: 0 4px 32px rgba(0,0,0,0.5); }
+.react-pdf__Page canvas { border-radius: 8px; box-shadow: 0 4px 32px rgba(0,0,0,0.5); max-width: 100%; }
+
+/* ── Mobile responsive ────────────────────────────────────────────────────── */
+
+/* On mobile: hide sidebar by default (MainLayout handles show/hide via transform) */
+@media (max-width: 767px) {
+  :root {
+    --sidebar-w: 260px;
+  }
+
+  /* Results list takes full width on mobile */
+  .results-list-panel {
+    width: 100% !important;
+    border-right: none !important;
+  }
+
+  /* PDF area takes full width on mobile */
+  .pdf-area-panel {
+    width: 100% !important;
+    padding: 8px !important;
+  }
+
+  /* Hide "Sign out" text on very small screens, keep icon */
+  .logout-text { display: none; }
+
+  /* Shrink nav link labels on mobile */
+  .nav-link-text { display: none; }
+
+  /* Toast smaller on mobile */
+  .toast-container {
+    bottom: 12px;
+    right: 12px;
+    left: 12px;
+  }
+  .toast {
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 400px) {
+  /* Very small phones */
+  :root {
+    --sidebar-w: 85vw;
+  }
+}

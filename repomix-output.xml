@@ -1,0 +1,5110 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+backend/
+  api/
+    __init__.py
+    routes_auth.py
+    routes_documents.py
+    routes_rag.py
+    routes_search.py
+    routes_upload.py
+  core/
+    __init__.py
+    config.py
+    deps.py
+    security.py
+  db/
+    __init__.py
+    models.py
+    postgres.py
+  ingestion/
+    __init__.py
+    pdf_parser.py
+  services/
+    __init__.py
+    chunking.py
+    embedding.py
+    ingestion_service.py
+    rag_service.py
+  utils/
+    __init__.py
+    file_utils.py
+  vector_store/
+    __init__.py
+    qdrant_client.py
+  main.py
+  requirements.txt
+docker/
+  docker-compose.yml
+  Dockerfile
+frontend/
+  public/
+    favicon.svg
+    icons.svg
+  src/
+    app/
+      App.jsx
+      ProtectedRoute.jsx
+      routes.jsx
+    features/
+      auth/
+        api.js
+        LoginPage.jsx
+        RegisterPage.jsx
+      documents/
+        api.js
+        DocumentList.jsx
+        Sidebar.jsx
+        UploadButton.jsx
+      rag/
+        AiSearchPage.jsx
+        AnswerPanel.jsx
+        api.js
+      search/
+        api.js
+        HighlightLayer.jsx
+        PDFViewer.jsx
+        SearchBar.jsx
+        SearchPage.jsx
+    hooks/
+      useAuth.js
+      useRag.js
+      useSearch.js
+    shared/
+      components/
+        Button.jsx
+        Input.jsx
+        Navbar.jsx
+      layout/
+        MainLayout.jsx
+      utils/
+        axios.js
+        constants.js
+        toast.js
+    store/
+      authStore.js
+      documentStore.js
+    index.css
+    main.jsx
+  .gitignore
+  eslint.config.js
+  index.html
+  package.json
+  postcss.config.js
+  README.md
+  tailwind.config.js
+  vite.config.js
+.gitignore
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="backend/api/__init__.py">
+
+</file>
+
+<file path="backend/api/routes_auth.py">
+from fastapi import APIRouter,Depends,HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from db.postgres import get_db
+from db.models import User
+from core.security import hash_password,verify_password,create_access_token
+
+router=APIRouter(prefix="/api",tags=["auth"])
+
+class RegisterRequest(BaseModel):
+    username:str
+    email:str
+    password:str
+
+class LoginRequest(BaseModel):
+    email:str
+    password:str
+
+@router.post("/register")
+def register(req:RegisterRequest,db:Session=Depends(get_db)):
+    if(db.query(User).filter(User.email==req.email).first()):
+        raise HTTPException(status_code=400,detail="Email already exist")
+    if(db.query(User).filter(User.username==req.username).first()):
+        raise HTTPException(status_code=400,detail="Username already exist")
+
+    user=User(
+        username=req.username,
+        email=req.email,
+        password_hash=hash_password(req.password)
+    )
+    db.add(user)
+    db.commit()
+
+    return {"message":"User created successfully.."}
+
+@router.post("/login")
+def login(req:LoginRequest,db:Session=Depends(get_db)):
+    user=db.query(User).filter(User.email==req.email).first()
+    if not user or not verify_password(req.password,user.password_hash): # type: ignore
+        raise HTTPException(status_code=401,detail="Invalid credentials")
+    token=create_access_token({"sub":str(user.id)})
+    return {
+        "access_token":token,
+        "token_type":"bearer"
+    }
+</file>
+
+<file path="backend/api/routes_rag.py">
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+import logging
+
+from core.deps import get_current_user
+from db.postgres import get_db
+from db.models import Document, User
+from services.embedding import embed_query
+from vector_store.qdrant_client import search_vectors
+from services.rag_service import generate_answer
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["rag"])
+
+MAX_QUERY_CHARS = 1000
+
+
+class RagRequest(BaseModel):
+    query: str
+    doc_id: str | None = None
+    # Raised from 5 → 10 so more chunks reach the ranker.
+    # With top_k=5 and only 2-3 chunks used by the LLM, best chunks
+    # spread across different pages could be missed entirely.
+    top_k: int = 10
+
+
+@router.post("/ai-search")
+def ai_search(
+    request: RagRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    query = request.query.strip()
+
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    if len(query) > MAX_QUERY_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Query too long ({len(query)} chars). Maximum allowed: {MAX_QUERY_CHARS}.",
+        )
+
+    # ── Resolve allowed documents ──────────────────────────────────────────
+    user_docs = db.query(Document).filter(Document.user_id == user.id).all()
+    allowed_doc_ids = {str(doc.doc_id) for doc in user_docs}
+
+    # Build doc_id → filename map so sources include filename without
+    # a separate /api/documents lookup on the frontend
+    doc_name_map: dict[str, str] = {
+        str(doc.doc_id): str(doc.filename) for doc in user_docs
+    }
+
+    if request.doc_id:
+        if request.doc_id not in allowed_doc_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+        allowed_doc_ids = {request.doc_id}
+
+    # ── Embed query ────────────────────────────────────────────────────────
+    try:
+        query_vector = embed_query(query)
+    except Exception as e:
+        logger.error("Embedding failed: %s", e)
+        raise HTTPException(status_code=500, detail="Embedding failed") from e
+
+    # ── Vector search ──────────────────────────────────────────────────────
+    try:
+        hits = search_vectors(
+            query_vector=query_vector,
+            doc_id=None,
+            top_k=request.top_k,
+        )
+    except Exception as e:
+        logger.error("Vector search failed: %s", e)
+        raise HTTPException(status_code=500, detail="Vector search failed") from e
+
+    # ── Filter to user's docs ──────────────────────────────────────────────
+    filtered_hits = [
+        hit for hit in hits
+        if hit.payload and str(hit.payload.get("doc_id")) in allowed_doc_ids
+    ]
+
+    if not filtered_hits:
+        return {
+            "query": query,
+            "answer": "No relevant information found.",
+            "sources": [],
+        }
+
+    # ── Build contexts + sources ───────────────────────────────────────────
+    contexts: list[str] = []
+    sources: list[dict] = []
+
+    for hit in filtered_hits:
+        payload = hit.payload or {}
+        content = str(payload.get("content", "")).strip()
+        hit_doc_id = str(payload.get("doc_id", ""))
+
+        if content:
+            contexts.append(content)
+            sources.append({
+                "doc_id": hit_doc_id,
+                "filename": doc_name_map.get(hit_doc_id, "unknown"),
+                "page_no": int(payload.get("page_no", 0)),
+                "score": round(float(hit.score), 4),
+                "content": content,
+            })
+
+    # ── Generate answer ────────────────────────────────────────────────────
+    try:
+        answer = generate_answer(query, contexts)
+    except RuntimeError as e:
+        logger.error("LLM generation failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error("Unexpected error in generate_answer: %s", e)
+        raise HTTPException(status_code=500, detail="Answer generation failed")
+
+    return {
+        "query": query,
+        "answer": answer,
+        "sources": sources,
+    }
+</file>
+
+<file path="backend/core/__init__.py">
+
+</file>
+
+<file path="backend/core/deps.py">
+from fastapi import Depends,HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt
+from sqlalchemy.orm import Session
+from typing import Optional
+from core.config import settings
+from db.postgres import get_db
+from db.models import User
+import uuid
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
+http_bearer = HTTPBearer(auto_error=False)
+
+def get_current_user(
+        
+        token_oauth: Optional[str] = Depends(oauth2_scheme),
+        token_http: Optional[HTTPAuthorizationCredentials] = Depends(http_bearer),
+        db: Session = Depends(get_db)
+):
+    token: Optional[str] = None
+    if token_http:
+        token = token_http.credentials
+
+    elif token_oauth:
+        token = token_oauth
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload=jwt.decode(token,settings.SECRET_KEY,algorithms=[settings.ALGORITHM])
+        user_id=payload.get("sub")
+
+        if not user_id:
+            raise HTTPException(status_code=401,detail="Invalid token")
+        
+        user=db.query(User).filter(User.id==uuid.UUID(user_id)).first()
+    except Exception:
+        raise HTTPException(status_code=401,detail="Invalid token")
+    
+    if not user:
+        raise HTTPException(status_code=401,detail="User not found")
+     
+    return user
+</file>
+
+<file path="backend/core/security.py">
+from datetime import datetime,timezone,timedelta
+from jose import jwt # type: ignore
+from passlib.context import CryptContext # type: ignore
+from core.config import settings
+
+pwd_context=CryptContext(schemes=['bcrypt'],deprecated="auto")
+
+def hash_password(password:str)->str:
+    return pwd_context.hash(password)
+
+def verify_password(password:str,hashed:str)->bool:
+    return pwd_context.verify(password,hashed)
+
+def create_access_token(data:dict):
+    to_encode=data.copy()
+    expire=datetime.now(timezone.utc)+timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode.update({"exp":expire})
+    return jwt.encode(to_encode,settings.SECRET_KEY,algorithm=settings.ALGORITHM)
+</file>
+
+<file path="backend/db/__init__.py">
+
+</file>
+
+<file path="backend/db/postgres.py">
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from core.config import settings
+import time
+
+if not settings.DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set in environment variables")
+
+engine = None
+
+for i in range(10):
+    try:
+        engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+        with engine.connect() as conn:
+            pass
+        print("Database connected successfully")
+        break
+    except Exception as e:
+        print(f"DB not ready, retrying... ({i+1}/10): {e}")
+        time.sleep(2)
+
+if engine is None:
+    raise Exception("Database connection failed after retries")
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+</file>
+
+<file path="backend/ingestion/__init__.py">
+
+</file>
+
+<file path="backend/ingestion/pdf_parser.py">
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+from typing import cast, List, Dict
+
+
+def extract_text_by_page(file_path: str) -> List[Dict]:
+    """
+    Extracts text from each page of a PDF.
+    Falls back to OCR for image-only pages.
+    Returns list of {"page_no": int, "text": str}
+    """
+    doc = fitz.open(file_path)
+    pages = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        text = cast(str, page.get_text("text"))
+
+        # OCR fallback for scanned pages
+        if not text.strip():
+            pix = page.get_pixmap(dpi=200)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            text = pytesseract.image_to_string(img)
+
+        if text.strip():
+            pages.append({
+                "page_no": page_num + 1,
+                "text": text.strip()
+            })
+
+    doc.close()
+    return pages
+</file>
+
+<file path="backend/services/__init__.py">
+
+</file>
+
+<file path="backend/services/embedding.py">
+from typing import List, cast
+from google import genai
+from google.genai.types import ContentListUnion
+
+from core.config import settings
+
+client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    """
+    Batch embed document chunks using Gemini.
+    """
+    if not texts:
+        return []
+
+    result = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=cast(ContentListUnion, texts),
+    )
+
+    embeddings = result.embeddings
+
+    if not embeddings:
+        raise ValueError("No embeddings returned")
+
+    output: List[List[float]] = []
+
+    for embedding in embeddings:
+        values = embedding.values
+
+        if values is None:
+            raise ValueError("Missing embedding values in batch response")
+
+        output.append(list(values))
+
+    return output
+
+
+def embed_query(query: str) -> List[float]:
+    """
+    Embed search query using Gemini.
+    """
+    result = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=query,
+    )
+
+    embeddings = result.embeddings
+
+    if not embeddings:
+        raise ValueError("No query embedding returned")
+
+    values = embeddings[0].values
+
+    if values is None:
+        raise ValueError("Missing query embedding values")
+
+    return list(values)
+</file>
+
+<file path="backend/services/ingestion_service.py">
+import uuid
+import logging
+
+from db.postgres import SessionLocal
+from db.models import Document, Chunk
+from ingestion.pdf_parser import extract_text_by_page
+from services.chunking import chunk_text
+from services.embedding import embed_texts
+from vector_store.qdrant_client import upsert_vectors, delete_vectors_by_ids
+from typing import cast
+logger = logging.getLogger(__name__)
+
+
+def process_document(doc_id: str, file_path: str) -> dict:
+    db = SessionLocal()
+    document = None
+    inserted_vector_ids = []
+
+    try:
+        document = db.query(Document).filter(Document.doc_id == doc_id).first()
+        if not document:
+            raise ValueError(f"Document {doc_id} not found in DB")
+
+        setattr(document, "status", "processing")
+        db.commit()
+
+        pages = extract_text_by_page(file_path)
+        logger.info(f"[{doc_id}] Extracted {len(pages)} pages")
+
+        if not pages:
+            setattr(document, "status", "failed")
+            db.commit()
+            return {"status": "failed", "reason": "no text extracted from document"}
+
+        all_chunks = []
+        for page in pages:
+            for chunk in chunk_text(page["text"]):
+                all_chunks.append((page["page_no"], chunk))
+
+        if not all_chunks:
+            setattr(document, "status", "failed")
+            db.commit()
+            return {"status": "failed", "reason": "no chunks produced"}
+
+        logger.info(f"[{doc_id}] Created {len(all_chunks)} chunks")
+
+        texts = [chunk["content"] for _, chunk in all_chunks]
+        embeddings = embed_texts(texts)
+
+        if len(embeddings) != len(all_chunks):
+            raise ValueError(
+                f"Embedding count mismatch: expected={len(all_chunks)}, got={len(embeddings)}"
+            )
+
+        logger.info(f"[{doc_id}] Embedded {len(embeddings)} chunks")
+
+        points = []
+        chunk_objects = []
+
+        for (page_no, chunk), vector in zip(all_chunks, embeddings):
+            vector_id = str(uuid.uuid4())
+            inserted_vector_ids.append(vector_id)
+
+            points.append({
+                "id": vector_id,
+                "vector": vector,
+                "payload": {
+                    "doc_id": doc_id,
+                    "page_no": page_no,
+                    "chunk_id": chunk["chunk_id"],
+                    "content": chunk["content"],
+                    "start_pos": chunk["start_pos"],
+                    "end_pos": chunk["end_pos"],
+                },
+            })
+
+            chunk_objects.append(Chunk(
+                doc_id=doc_id,
+                page_no=page_no,
+                chunk_id=chunk["chunk_id"],
+                content=chunk["content"],
+                start_pos=chunk["start_pos"],
+                end_pos=chunk["end_pos"],
+                vector_id=vector_id,
+            ))
+
+        upsert_vectors(points)
+        logger.info(f"[{doc_id}] Upserted {len(points)} vectors to Qdrant")
+
+        try:
+            db.bulk_save_objects(chunk_objects)
+            setattr(document, "status", "completed")
+            setattr(document, "total_chunks", len(chunk_objects))
+            db.commit()
+        except Exception as db_err:
+            db.rollback()
+            logger.error(f"[{doc_id}] DB save failed, rolling back vectors: {db_err}")
+            delete_vectors_by_ids(inserted_vector_ids)
+            raise db_err
+
+        logger.info(f"[{doc_id}] Completed. {len(chunk_objects)} chunks saved.")
+        return {"status": "completed", "chunks": len(chunk_objects)}
+
+    except Exception as e:
+        logger.error(f"[{doc_id}] Processing failed: {e}")
+        try:
+            if document:
+                setattr(document, "status", "failed")
+                db.commit()
+        except Exception:
+            db.rollback()
+        raise
+
+    finally:
+        db.close()
+</file>
+
+<file path="backend/services/rag_service.py">
+import re
+import time
+import logging
+from typing import List
+
+from openai import OpenAI, APIError, RateLimitError, APITimeoutError
+from core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# ── OpenRouter client ─────────────────────────────────────────────────────────
+client = OpenAI(
+    api_key=settings.OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+)
+
+MODEL = "deepseek/deepseek-r1"
+
+# ✅ FIX 1: raised from 400 → 1500 chars per chunk.
+# 400 was silently cutting off data mid-sentence. The education chunk in the
+# example is ~377 chars and just barely survived, but any slightly longer chunk
+# (skills, projects) would be truncated before reaching the LLM.
+# 1500 chars ≈ ~300 words — comfortably fits a dense resume section while
+# staying well within the 150-token output budget + model context window.
+CHUNK_CHAR_LIMIT = 1500
+
+# How many top-ranked chunks are passed to the LLM.
+TOP_K_CHUNKS = 3
+
+MAX_RETRIES = 2
+RETRY_DELAY = 2
+
+
+# ── Detect multi-part queries ─────────────────────────────────────────────────
+def is_multi_part_query(query: str) -> bool:
+    """
+    Returns True when the query contains multiple distinct questions or
+    entities joined by commas, 'and', 'also', semicolons, etc.
+    Examples that return True:
+      - "what is cgpa, 10th percentage and 12th percentage"
+      - "name, skills and experience of john"
+    """
+    parts = re.split(r"[,;]|\band\b|\balso\b", query.lower())
+    # Discard very short fragments (stop words, articles) — count real parts
+    meaningful = [p.strip() for p in parts if len(p.strip()) > 3]
+    return len(meaningful) >= 2
+
+
+# ── Keyword re-ranking ────────────────────────────────────────────────────────
+def rank_chunks(query: str, chunks: List[str]) -> List[str]:
+    """
+    Sort chunks by number of query-word hits so the most relevant context
+    reaches the LLM first. Ties preserved in original order.
+    """
+    query_words = set(query.lower().split())
+    scored = [
+        (sum(word in chunk.lower() for word in query_words), i, chunk)
+        for i, chunk in enumerate(chunks)
+    ]
+    scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+    return [chunk for _, _, chunk in scored]
+
+
+# ── ✅ FIX 2: structured regex extraction removed from generate_answer ─────────
+# The old code ran regex extraction BEFORE the LLM call and returned
+# immediately on the first match. For the query:
+#   "what is cgpa, 10th percentage and also 12th percentage of tejas"
+# the CGPA regex fired and returned "CGPA: 8.20" — the other two values
+# (77% HSC, 80.80% SSC) were NEVER returned because the function exited early.
+#
+# Regex extraction is now a POST-PROCESSING step: if the LLM answer is
+# suspiciously short (≤ 10 chars) or empty, we attempt regex as a last-resort
+# fallback, not as a shortcut that bypasses the LLM.
+def _regex_fallback(query: str, contexts: List[str]) -> str | None:
+    """
+    Last-resort structured extraction when the LLM returns nothing useful.
+    Intentionally conservative — only fires when LLM output is empty/garbage.
+    """
+    combined = " ".join(contexts)
+    q = query.lower()
+    results = []
+
+    if "cgpa" in q:
+        m = re.search(r"CGPA[:\s]*([0-9]+(?:\.[0-9]+)?(?:/10)?)", combined, re.IGNORECASE)
+        if m:
+            results.append(f"CGPA: {m.group(1)}")
+
+    if "percentage" in q or "10th" in q or "ssc" in q:
+        # SSC / 10th — look for patterns like "Percentage: 80.80%" near SSC/10th context
+        m = re.search(
+            r"SSC.*?Percentage[:\s]*([0-9]+(?:\.[0-9]+)?)\s*%|"
+            r"10th.*?([0-9]+(?:\.[0-9]+)?)\s*%",
+            combined, re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            val = m.group(1) or m.group(2)
+            results.append(f"10th (SSC) percentage: {val}%")
+
+    if "percentage" in q or "12th" in q or "hsc" in q:
+        # HSC / 12th
+        m = re.search(
+            r"HSC.*?Percentage[:\s]*([0-9]+(?:\.[0-9]+)?)\s*%|"
+            r"12th.*?([0-9]+(?:\.[0-9]+)?)\s*%",
+            combined, re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            val = m.group(1) or m.group(2)
+            results.append(f"12th (HSC) percentage: {val}%")
+
+    return "\n".join(results) if results else None
+
+
+# ── Prompt builder ────────────────────────────────────────────────────────────
+def build_prompt(query: str, contexts: List[str], multi_part: bool) -> str:
+    """
+    Build the LLM prompt.
+
+    ✅ FIX 3: The old prompt said "Answer in 1-2 lines only." That single
+    constraint caused the LLM to answer only the first sub-question it found
+    and stop, even when the query had 3 distinct parts.
+
+    The new prompt:
+    - Detects multi-part queries and explicitly tells the LLM to answer EACH part.
+    - Removes the "1-2 lines" cap so multi-part answers can be bullet-listed.
+    - Still enforces "only from context" to prevent hallucination.
+    """
+    # ✅ FIX 1 effect: use the raised CHUNK_CHAR_LIMIT — no more data truncation
+    trimmed = [c[:CHUNK_CHAR_LIMIT] for c in contexts[:TOP_K_CHUNKS]]
+    context_text = "\n\n---\n\n".join(trimmed)
+
+    if multi_part:
+        answer_instruction = (
+            "The question has MULTIPLE parts. "
+            "Answer EACH part separately as a bullet point. "
+            "If any part is not found in the context, write 'Not found' for that part only."
+        )
+    else:
+        answer_instruction = (
+            "Give a short, precise answer (1-3 sentences). "
+            "Extract exact values if present (numbers, names, dates). "
+            "If the answer is not in the context, say: 'Not found in document'."
+        )
+
+    return (
+        "You are a precise information extraction assistant.\n\n"
+        "Answer ONLY using the context provided below. "
+        "Do NOT add any information from outside the context.\n\n"
+        f"Instruction: {answer_instruction}\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Question:\n{query}\n\n"
+        "Answer:"
+    )
+
+
+# ── Main generation function ──────────────────────────────────────────────────
+def generate_answer(query: str, contexts: List[str]) -> str:
+    """
+    Full RAG answer pipeline:
+      1. Re-rank chunks by keyword overlap
+      2. Detect whether query has multiple parts
+      3. Build an appropriate prompt (multi-part vs single)
+      4. Call OpenRouter LLM with retry + exponential back-off
+      5. Regex fallback only if LLM returns empty/garbage
+      6. Raise RuntimeError on total failure (caller returns HTTP 500)
+    """
+    if not contexts:
+        return "No relevant information found."
+
+    # Step 1 — re-rank
+    ranked = rank_chunks(query, contexts)
+
+    # Step 2 — detect query complexity
+    multi_part = is_multi_part_query(query)
+    logger.info("Query multi-part: %s", multi_part)
+
+    # Step 3 — build prompt
+    prompt = build_prompt(query, ranked, multi_part)
+
+    # Step 4 — LLM call with retry
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                # ✅ FIX 4 (partial): raised max_tokens from 150 → 400 so the
+                # LLM can actually write out bullet answers for multi-part queries.
+                # 150 tokens was enough for a single value but forced truncation
+                # the moment the answer had more than ~2 facts.
+                max_tokens=400,
+            )
+
+            content = response.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
+
+            logger.warning("OpenRouter returned empty content on attempt %d", attempt)
+
+        except RateLimitError as e:
+            logger.warning("Rate limit on attempt %d: %s", attempt, e)
+            last_error = e
+            time.sleep(RETRY_DELAY * attempt)
+
+        except APITimeoutError as e:
+            logger.warning("Timeout on attempt %d: %s", attempt, e)
+            last_error = e
+            time.sleep(RETRY_DELAY)
+
+        except APIError as e:
+            logger.error("API error on attempt %d: %s", attempt, e)
+            last_error = e
+            time.sleep(RETRY_DELAY)
+
+        except Exception as e:
+            logger.error("Unexpected error: %s", e)
+            raise RuntimeError(f"LLM call failed unexpectedly: {e}") from e
+
+    # Step 5 — regex fallback (only when LLM is completely unresponsive)
+    logger.warning("LLM failed %d times, attempting regex fallback", MAX_RETRIES)
+    fallback = _regex_fallback(query, ranked)
+    if fallback:
+        return fallback
+
+    # Step 6 — total failure
+    raise RuntimeError(
+        f"OpenRouter failed after {MAX_RETRIES} attempts. Last error: {last_error}"
+    )
+</file>
+
+<file path="backend/utils/__init__.py">
+
+</file>
+
+<file path="backend/utils/file_utils.py">
+import os
+import uuid
+
+ALLOWED_TYPES = ["pdf"]  # focusing on PDF for now; add png/jpg when OCR is needed
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def validate_file(filename: str, size: int) -> str:
+    if not filename or "." not in filename:
+        raise ValueError("Invalid filename")
+
+    ext = filename.rsplit(".", 1)[-1].lower()
+
+    if ext not in ALLOWED_TYPES:
+        raise ValueError(f"Unsupported file type: .{ext}. Allowed: {ALLOWED_TYPES}")
+
+    if size > MAX_FILE_SIZE:
+        raise ValueError(f"File size {size} exceeds 10MB limit")
+
+    return ext
+
+
+def generate_doc_id() -> str:
+    return str(uuid.uuid4())
+
+
+def get_file_path(doc_id: str, ext: str) -> str:
+    storage_dir = "storage"
+    os.makedirs(storage_dir, exist_ok=True)
+    return os.path.join(storage_dir, f"{doc_id}.{ext}")
+</file>
+
+<file path="backend/vector_store/__init__.py">
+
+</file>
+
+<file path="docker/docker-compose.yml">
+services:
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: fastapi_app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    dns:
+    - 8.8.8.8
+    - 8.8.4.4
+    env_file:
+      - ../backend/.env
+    restart: always
+
+  postgres:
+    image: postgres:15
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+      POSTGRES_DB: docdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d docdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant
+    container_name: qdrant_db
+    restart: always
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  postgres_data:
+  qdrant_data:
+</file>
+
+<file path="docker/Dockerfile">
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for OCR and PDF rendering
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ .
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+</file>
+
+<file path="frontend/public/favicon.svg">
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="46" fill="none" viewBox="0 0 48 46"><path fill="#863bff" d="M25.946 44.938c-.664.845-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.287c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.497 0-3.578-1.842-3.578H1.237c-.92 0-1.456-1.04-.92-1.788L10.013.474c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.579 1.842 3.579h11.377c.943 0 1.473 1.088.89 1.83L25.947 44.94z" style="fill:#863bff;fill:color(display-p3 .5252 .23 1);fill-opacity:1"/><mask id="a" width="48" height="46" x="0" y="0" maskUnits="userSpaceOnUse" style="mask-type:alpha"><path fill="#000" d="M25.842 44.938c-.664.844-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.183c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.498 0-3.579-1.842-3.579H1.133c-.92 0-1.456-1.04-.92-1.787L9.91.473c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.578 1.842 3.578h11.377c.943 0 1.473 1.088.89 1.832L25.843 44.94z" style="fill:#000;fill-opacity:1"/></mask><g mask="url(#a)"><g filter="url(#b)"><ellipse cx="5.508" cy="14.704" fill="#ede6ff" rx="5.508" ry="14.704" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -4.47 31.516)"/></g><g filter="url(#c)"><ellipse cx="10.399" cy="29.851" fill="#ede6ff" rx="10.399" ry="29.851" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -39.328 7.883)"/></g><g filter="url(#d)"><ellipse cx="5.508" cy="30.487" fill="#7e14ff" rx="5.508" ry="30.487" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.814 -25.913 -14.639)scale(1 -1)"/></g><g filter="url(#e)"><ellipse cx="5.508" cy="30.599" fill="#7e14ff" rx="5.508" ry="30.599" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.814 -32.644 -3.334)scale(1 -1)"/></g><g filter="url(#f)"><ellipse cx="5.508" cy="30.599" fill="#7e14ff" rx="5.508" ry="30.599" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -34.34 30.47)"/></g><g filter="url(#g)"><ellipse cx="14.072" cy="22.078" fill="#ede6ff" rx="14.072" ry="22.078" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="rotate(93.35 24.506 48.493)scale(-1 1)"/></g><g filter="url(#h)"><ellipse cx="3.47" cy="21.501" fill="#7e14ff" rx="3.47" ry="21.501" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.009 28.708 47.59)scale(-1 1)"/></g><g filter="url(#i)"><ellipse cx="3.47" cy="21.501" fill="#7e14ff" rx="3.47" ry="21.501" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.009 28.708 47.59)scale(-1 1)"/></g><g filter="url(#j)"><ellipse cx=".387" cy="8.972" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(39.51 .387 8.972)"/></g><g filter="url(#k)"><ellipse cx="47.523" cy="-6.092" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 47.523 -6.092)"/></g><g filter="url(#l)"><ellipse cx="41.412" cy="6.333" fill="#47bfff" rx="5.971" ry="9.665" style="fill:#47bfff;fill:color(display-p3 .2799 .748 1);fill-opacity:1" transform="rotate(37.892 41.412 6.333)"/></g><g filter="url(#m)"><ellipse cx="-1.879" cy="38.332" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 -1.88 38.332)"/></g><g filter="url(#n)"><ellipse cx="-1.879" cy="38.332" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 -1.88 38.332)"/></g><g filter="url(#o)"><ellipse cx="35.651" cy="29.907" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 35.651 29.907)"/></g><g filter="url(#p)"><ellipse cx="38.418" cy="32.4" fill="#47bfff" rx="5.971" ry="15.297" style="fill:#47bfff;fill:color(display-p3 .2799 .748 1);fill-opacity:1" transform="rotate(37.892 38.418 32.4)"/></g></g><defs><filter id="b" width="60.045" height="41.654" x="-19.77" y="16.149" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="c" width="90.34" height="51.437" x="-54.613" y="-7.533" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="d" width="79.355" height="29.4" x="-49.64" y="2.03" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="e" width="79.579" height="29.4" x="-45.045" y="20.029" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="f" width="79.579" height="29.4" x="-43.513" y="21.178" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="g" width="74.749" height="58.852" x="15.756" y="-17.901" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="h" width="61.377" height="25.362" x="23.548" y="2.284" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="i" width="61.377" height="25.362" x="23.548" y="2.284" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="j" width="56.045" height="63.649" x="-27.636" y="-22.853" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="k" width="54.814" height="64.646" x="20.116" y="-38.415" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="l" width="33.541" height="35.313" x="24.641" y="-11.323" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="m" width="54.814" height="64.646" x="-29.286" y="6.009" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="n" width="54.814" height="64.646" x="-29.286" y="6.009" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="o" width="54.814" height="64.646" x="8.244" y="-2.416" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="p" width="39.409" height="43.623" x="18.713" y="10.588" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter></defs></svg>
+</file>
+
+<file path="frontend/public/icons.svg">
+<svg xmlns="http://www.w3.org/2000/svg">
+  <symbol id="bluesky-icon" viewBox="0 0 16 17">
+    <g clip-path="url(#bluesky-clip)"><path fill="#08060d" d="M7.75 7.735c-.693-1.348-2.58-3.86-4.334-5.097-1.68-1.187-2.32-.981-2.74-.79C.188 2.065.1 2.812.1 3.251s.241 3.602.398 4.13c.52 1.744 2.367 2.333 4.07 2.145-2.495.37-4.71 1.278-1.805 4.512 3.196 3.309 4.38-.71 4.987-2.746.608 2.036 1.307 5.91 4.93 2.746 2.72-2.746.747-4.143-1.747-4.512 1.702.189 3.55-.4 4.07-2.145.156-.528.397-3.691.397-4.13s-.088-1.186-.575-1.406c-.42-.19-1.06-.395-2.741.79-1.755 1.24-3.64 3.752-4.334 5.099"/></g>
+    <defs><clipPath id="bluesky-clip"><path fill="#fff" d="M.1.85h15.3v15.3H.1z"/></clipPath></defs>
+  </symbol>
+  <symbol id="discord-icon" viewBox="0 0 20 19">
+    <path fill="#08060d" d="M16.224 3.768a14.5 14.5 0 0 0-3.67-1.153c-.158.286-.343.67-.47.976a13.5 13.5 0 0 0-4.067 0c-.128-.306-.317-.69-.476-.976A14.4 14.4 0 0 0 3.868 3.77C1.546 7.28.916 10.703 1.231 14.077a14.7 14.7 0 0 0 4.5 2.306q.545-.748.965-1.587a9.5 9.5 0 0 1-1.518-.74q.191-.14.372-.293c2.927 1.369 6.107 1.369 8.999 0q.183.152.372.294-.723.437-1.52.74.418.838.963 1.588a14.6 14.6 0 0 0 4.504-2.308c.37-3.911-.63-7.302-2.644-10.309m-9.13 8.234c-.878 0-1.599-.82-1.599-1.82 0-.998.705-1.82 1.6-1.82.894 0 1.614.82 1.599 1.82.001 1-.705 1.82-1.6 1.82m5.91 0c-.878 0-1.599-.82-1.599-1.82 0-.998.705-1.82 1.6-1.82.893 0 1.614.82 1.599 1.82 0 1-.706 1.82-1.6 1.82"/>
+  </symbol>
+  <symbol id="documentation-icon" viewBox="0 0 21 20">
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="m15.5 13.333 1.533 1.322c.645.555.967.833.967 1.178s-.322.623-.967 1.179L15.5 18.333m-3.333-5-1.534 1.322c-.644.555-.966.833-.966 1.178s.322.623.966 1.179l1.534 1.321"/>
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M17.167 10.836v-4.32c0-1.41 0-2.117-.224-2.68-.359-.906-1.118-1.621-2.08-1.96-.599-.21-1.349-.21-2.848-.21-2.623 0-3.935 0-4.983.369-1.684.591-3.013 1.842-3.641 3.428C3 6.449 3 7.684 3 10.154v2.122c0 2.558 0 3.838.706 4.726q.306.383.713.671c.76.536 1.79.64 3.581.66"/>
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M3 10a2.78 2.78 0 0 1 2.778-2.778c.555 0 1.209.097 1.748-.047.48-.129.854-.503.982-.982.145-.54.048-1.194.048-1.749a2.78 2.78 0 0 1 2.777-2.777"/>
+  </symbol>
+  <symbol id="github-icon" viewBox="0 0 19 19">
+    <path fill="#08060d" fill-rule="evenodd" d="M9.356 1.85C5.05 1.85 1.57 5.356 1.57 9.694a7.84 7.84 0 0 0 5.324 7.44c.387.079.528-.168.528-.376 0-.182-.013-.805-.013-1.454-2.165.467-2.616-.935-2.616-.935-.349-.91-.864-1.143-.864-1.143-.71-.48.051-.48.051-.48.787.051 1.2.805 1.2.805.695 1.194 1.817.857 2.268.649.064-.507.27-.857.49-1.052-1.728-.182-3.545-.857-3.545-3.87 0-.857.31-1.558.8-2.104-.078-.195-.349-1 .077-2.078 0 0 .657-.208 2.14.805a7.5 7.5 0 0 1 1.946-.26c.657 0 1.328.092 1.946.26 1.483-1.013 2.14-.805 2.14-.805.426 1.078.155 1.883.078 2.078.502.546.799 1.247.799 2.104 0 3.013-1.818 3.675-3.558 3.87.284.247.528.714.528 1.454 0 1.052-.012 1.896-.012 2.156 0 .208.142.455.528.377a7.84 7.84 0 0 0 5.324-7.441c.013-4.338-3.48-7.844-7.773-7.844" clip-rule="evenodd"/>
+  </symbol>
+  <symbol id="social-icon" viewBox="0 0 20 20">
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M12.5 6.667a4.167 4.167 0 1 0-8.334 0 4.167 4.167 0 0 0 8.334 0"/>
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M2.5 16.667a5.833 5.833 0 0 1 8.75-5.053m3.837.474.513 1.035c.07.144.257.282.414.309l.93.155c.596.1.736.536.307.965l-.723.73a.64.64 0 0 0-.152.531l.207.903c.164.715-.213.991-.84.618l-.872-.52a.63.63 0 0 0-.577 0l-.872.52c-.624.373-1.003.094-.84-.618l.207-.903a.64.64 0 0 0-.152-.532l-.723-.729c-.426-.43-.289-.864.306-.964l.93-.156a.64.64 0 0 0 .412-.31l.513-1.034c.28-.562.735-.562 1.012 0"/>
+  </symbol>
+  <symbol id="x-icon" viewBox="0 0 19 19">
+    <path fill="#08060d" fill-rule="evenodd" d="M1.893 1.98c.052.072 1.245 1.769 2.653 3.77l2.892 4.114c.183.261.333.48.333.486s-.068.089-.152.183l-.522.593-.765.867-3.597 4.087c-.375.426-.734.834-.798.905a1 1 0 0 0-.118.148c0 .01.236.017.664.017h.663l.729-.83c.4-.457.796-.906.879-.999a692 692 0 0 0 1.794-2.038c.034-.037.301-.34.594-.675l.551-.624.345-.392a7 7 0 0 1 .34-.374c.006 0 .93 1.306 2.052 2.903l2.084 2.965.045.063h2.275c1.87 0 2.273-.003 2.266-.021-.008-.02-1.098-1.572-3.894-5.547-2.013-2.862-2.28-3.246-2.273-3.266.008-.019.282-.332 2.085-2.38l2-2.274 1.567-1.782c.022-.028-.016-.03-.65-.03h-.674l-.3.342a871 871 0 0 1-1.782 2.025c-.067.075-.405.458-.75.852a100 100 0 0 1-.803.91c-.148.172-.299.344-.99 1.127-.304.343-.32.358-.345.327-.015-.019-.904-1.282-1.976-2.808L6.365 1.85H1.8zm1.782.91 8.078 11.294c.772 1.08 1.413 1.973 1.425 1.984.016.017.241.02 1.05.017l1.03-.004-2.694-3.766L7.796 5.75 5.722 2.852l-1.039-.004-1.039-.004z" clip-rule="evenodd"/>
+  </symbol>
+</svg>
+</file>
+
+<file path="frontend/src/app/App.jsx">
+
+</file>
+
+<file path="frontend/src/app/ProtectedRoute.jsx">
+import { Navigate } from "react-router-dom"
+
+export default function ProtectedRoute({ children }) {
+  const token = localStorage.getItem("token")
+
+  if (!token) {
+    return <Navigate to="/login" />
+  }
+
+  return children
+}
+</file>
+
+<file path="frontend/src/features/documents/api.js">
+import api from "../../shared/utils/axios"
+
+export const fetchDocuments = async () => {
+  const res = await api.get("/documents")
+  return res.data
+}
+
+export const uploadDocument = async (file) => {
+  const formData = new FormData()
+  formData.append("file", file)
+
+  const res = await api.post("/upload", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+  })
+
+  return res.data
+}
+
+export const deleteDocument = async (docId) => {
+  const res = await api.delete(`/documents/${docId}`)
+  return res.data
+}
+
+export const getDocumentStatus = async (docId) => {
+  const res = await api.get(`/document/${docId}/status`)
+  return res.data
+}
+</file>
+
+<file path="frontend/src/features/rag/api.js">
+import api from "../../shared/utils/axios"
+
+export const aiSearch = async (query) => {
+  const res = await api.post("/ai-search", {
+    query,
+    top_k: 5,
+  })
+
+  return res.data
+}
+</file>
+
+<file path="frontend/src/features/search/api.js">
+import api from "../../shared/utils/axios"
+
+export const searchDocuments = async (query) => {
+  const res = await api.get("/search", {
+    params: { q: query }
+  })
+  return res.data
+}
+</file>
+
+<file path="frontend/src/features/search/HighlightLayer.jsx">
+import { useEffect, useRef } from "react"
+import { pdfjs } from "react-pdf"
+
+/**
+ * HighlightLayer — canvas-based highlight overlay.
+ *
+ * Strategy:
+ *  1. Always attempt pdfjs page.getTextContent() for coordinate-based highlights.
+ *     This works for text-embedded PDFs perfectly.
+ *
+ *  2. For image/scanned PDFs pdfjs returns 0 text items (no embedded text layer).
+ *     In that case we fall back to checking if the OCR `chunkText` (from search
+ *     results, already extracted by pytesseract on the backend) contains the keyword.
+ *     If yes, we draw a soft highlight banner across the top of the page so the
+ *     user knows this page is a match.
+ *
+ * Props:
+ *   fileProp    — stable { url, httpHeaders } object (memoized in PDFViewer)
+ *   pageNum     — 1-based page number currently shown
+ *   query       — raw search query string
+ *   renderedSize — { width, height } of the rendered PDF canvas in CSS px
+ *   chunkText   — OCR/extracted text for this page from search results (fallback)
+ */
+export default function HighlightLayer({ fileProp, pageNum, query, renderedSize, chunkText }) {
+  const canvasRef = useRef(null)
+
+  useEffect(() => {
+    if (!query || !fileProp?.url || !renderedSize?.width || !renderedSize?.height) return
+
+    // ── Build keyword set from query only ─────────────────────────────────────
+    const stopWords = new Set([
+      "the","a","an","is","are","was","were","be","been","being",
+      "have","has","had","do","does","did","will","would","could",
+      "should","may","might","shall","can","need","dare","ought",
+      "used","to","of","in","on","at","by","for","with","about",
+      "as","into","through","during","before","after","above","below",
+      "from","up","down","out","off","over","under","again","and",
+      "but","or","nor","so","yet","both","either","neither","not",
+      "no","its","it","this","that","these","those","i","you","he",
+      "she","we","they","what","which","who","whom","how","all",
+      "each","few","more","most","other","some","such","than","too",
+      "very","just","also",
+    ])
+
+    const keywords = query
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 1 && !stopWords.has(w))
+
+    if (keywords.length === 0) return
+
+    let cancelled = false
+
+    const drawOnCanvas = (drawFn) => {
+      const canvas = canvasRef.current
+      if (!canvas || cancelled) return
+      canvas.width = renderedSize.width
+      canvas.height = renderedSize.height
+      const ctx = canvas.getContext("2d")
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      drawFn(ctx, canvas.width, canvas.height)
+    }
+
+    const run = async () => {
+      try {
+        // ── Load PDF via pdfjs (browser caches — no re-download) ──────────────
+        const loadingTask = pdfjs.getDocument({
+          url: fileProp.url,
+          httpHeaders: fileProp.httpHeaders || {},
+          withCredentials: false,
+        })
+
+        const pdfDoc = await loadingTask.promise
+        if (cancelled) return
+
+        const page = await pdfDoc.getPage(pageNum)
+        if (cancelled) return
+
+        const naturalViewport = page.getViewport({ scale: 1 })
+        const scaleX = renderedSize.width / naturalViewport.width
+        const scaleY = renderedSize.height / naturalViewport.height
+
+        const textContent = await page.getTextContent()
+        if (cancelled) return
+
+        // ── Check if this page has any embedded text items ────────────────────
+        const hasEmbeddedText = textContent.items.some(
+          (item) => item.str && item.str.trim().length > 0
+        )
+
+        if (hasEmbeddedText) {
+          // ── STRATEGY 1: coordinate-based highlights (text PDFs) ───────────
+          drawOnCanvas((ctx) => {
+            ctx.fillStyle = "rgba(251, 191, 36, 0.50)"
+
+            for (const item of textContent.items) {
+              const str = item.str
+              if (!str || !str.trim()) continue
+
+              const itemClean = str.toLowerCase().replace(/[^a-z0-9\s]/g, " ")
+              const itemWords = itemClean.split(/\s+/).filter(Boolean)
+              const matched = keywords.some((kw) =>
+                itemWords.some((w) => w === kw)
+              )
+              if (!matched) continue
+
+              // transform = [a, b, c, d, tx, ty]
+              // tx,ty = bottom-left origin in PDF coords (Y-axis up)
+              const [, , , fontSizePdf, tx, ty] = item.transform
+
+              const itemW = item.width > 0
+                ? item.width
+                : Math.abs(fontSizePdf) * str.length * 0.55
+              const itemH = item.height > 0
+                ? item.height
+                : Math.abs(fontSizePdf)
+
+              // Flip Y: PDF Y=0 is bottom, canvas Y=0 is top
+              const cx = tx * scaleX
+              const cy = renderedSize.height - (ty * scaleY) - (itemH * scaleY)
+              const cw = itemW * scaleX
+              const ch = itemH * scaleY
+
+              const pad = 1
+              ctx.fillRect(cx - pad, cy - pad, cw + pad * 2, ch + pad * 2)
+            }
+          })
+        } else {
+          // ── STRATEGY 2: image/scanned page — use OCR chunkText fallback ───
+          // Check if the OCR text for this page (from search results) contains
+          // any of the search keywords.
+          const ocrText = (chunkText || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ")
+          const ocrWords = new Set(ocrText.split(/\s+/).filter(Boolean))
+          const ocrMatch = keywords.some((kw) => ocrWords.has(kw))
+
+          if (ocrMatch) {
+            // Draw a labelled banner at the top of the page so user knows
+            // the keyword was found by OCR on this scanned page
+            drawOnCanvas((ctx, w) => {
+              // Semi-transparent amber banner
+              ctx.fillStyle = "rgba(251, 191, 36, 0.20)"
+              ctx.fillRect(0, 0, w, 36)
+
+              // Left accent bar
+              ctx.fillStyle = "rgba(251, 191, 36, 0.85)"
+              ctx.fillRect(0, 0, 4, 36)
+
+              // Label text
+              ctx.fillStyle = "rgba(120, 80, 0, 0.9)"
+              ctx.font = "bold 12px 'Sora', sans-serif"
+              ctx.fillText(`Keyword found via OCR: "${keywords.join(", ")}"`, 12, 23)
+            })
+          }
+        }
+      } catch (err) {
+        if (!cancelled) console.warn("HighlightLayer error:", err)
+      }
+    }
+
+    run()
+
+    return () => {
+      cancelled = true
+      const canvas = canvasRef.current
+      if (canvas) {
+        const ctx = canvas.getContext("2d")
+        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
+      }
+    }
+  // fileProp is memoized in PDFViewer so this won't fire on every render
+  }, [fileProp, pageNum, query, renderedSize, chunkText])
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+        borderRadius: 8,
+        mixBlendMode: "multiply",
+      }}
+      aria-hidden="true"
+    />
+  )
+}
+</file>
+
+<file path="frontend/src/features/search/SearchBar.jsx">
+import { useState } from "react"
+
+export default function SearchBar({ onSearch }) {
+  const [input, setInput] = useState("")
+
+  return (
+    <div className="mb-4 flex gap-2">
+      <input
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        className="border p-2 flex-1"
+        placeholder="Search..."
+      />
+
+      <button
+        onClick={() => onSearch(input)}
+        className="bg-blue-500 text-white px-4"
+      >
+        Search
+      </button>
+    </div>
+  )
+}
+</file>
+
+<file path="frontend/src/hooks/useAuth.js">
+
+</file>
+
+<file path="frontend/src/hooks/useRag.js">
+import { useState } from "react"
+
+export default function useRag() {
+  const [answer, setAnswer] = useState("")
+  const [sources, setSources] = useState([])
+  const [loading, setLoading] = useState(false)
+
+  const reset = () => {
+    setAnswer("")
+    setSources([])
+  }
+
+  return {
+    answer,
+    setAnswer,
+    sources,
+    setSources,
+    loading,
+    setLoading,
+    reset,
+  }
+}
+</file>
+
+<file path="frontend/src/hooks/useSearch.js">
+import { useState } from "react"
+
+export default function useSearch() {
+  const [results, setResults] = useState([])
+  const [activeDoc, setActiveDoc] = useState(null)
+  const [activePage, setActivePage] = useState(null)
+  const [query, setQuery] = useState("")
+
+  const resetSearch = () => {
+    setResults([])
+    setActiveDoc(null)
+    setActivePage(null)
+  }
+
+  return {
+    results,
+    setResults,
+    activeDoc,
+    setActiveDoc,
+    activePage,
+    setActivePage,
+    query,
+    setQuery,
+    resetSearch,
+  }
+}
+</file>
+
+<file path="frontend/src/shared/components/Button.jsx">
+
+</file>
+
+<file path="frontend/src/shared/components/Input.jsx">
+
+</file>
+
+<file path="frontend/src/shared/utils/constants.js">
+
+</file>
+
+<file path="frontend/src/shared/utils/toast.js">
+// Lightweight in-memory toast system — no extra library needed
+// Usage: import { toast } from "../shared/utils/toast"
+//        toast.success("Uploaded!") | toast.error("Failed") | toast.info("...")
+
+const container = (() => {
+  let el = null
+  return () => {
+    if (!el) {
+      el = document.createElement("div")
+      el.className = "toast-container"
+      document.body.appendChild(el)
+    }
+    return el
+  }
+})()
+
+function show(message, type = "info", duration = 3500) {
+  const c = container()
+  const toast = document.createElement("div")
+  toast.className = `toast toast-${type}`
+  toast.textContent = message
+  c.appendChild(toast)
+
+  setTimeout(() => {
+    toast.style.opacity = "0"
+    toast.style.transform = "translateY(8px)"
+    toast.style.transition = "opacity 0.2s ease, transform 0.2s ease"
+    setTimeout(() => toast.remove(), 220)
+  }, duration)
+}
+
+export const toast = {
+  success: (msg) => show(msg, "success"),
+  error: (msg) => show(msg, "error"),
+  info: (msg) => show(msg, "info"),
+}
+</file>
+
+<file path="frontend/src/store/authStore.js">
+
+</file>
+
+<file path="frontend/src/store/documentStore.js">
+import { create } from "zustand"
+
+export const useDocumentStore = create((set) => ({
+  documents: [],
+  selectedDoc: null,
+  loading: false,
+
+  setDocuments: (docs) => set({ documents: docs }),
+  setSelectedDoc: (doc) => set({ selectedDoc: doc }),
+  setLoading: (val) => set({ loading: val }),
+
+  removeDocument: (docId) =>
+    set((state) => ({
+      documents: state.documents.filter((d) => d.doc_id !== docId),
+    })),
+
+  updateDocumentStatus: (docId, status) =>
+    set((state) => ({
+      documents: state.documents.map((d) =>
+        d.doc_id === docId ? { ...d, status } : d
+      ),
+    })),
+}))
+</file>
+
+<file path="frontend/.gitignore">
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+</file>
+
+<file path="frontend/eslint.config.js">
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{js,jsx}'],
+    extends: [
+      js.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      globals: globals.browser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+  },
+])
+</file>
+
+<file path="frontend/package.json">
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.100.6",
+    "axios": "^1.15.2",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "react-pdf": "^10.4.1",
+    "react-router-dom": "^7.14.2",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "eslint": "^10.2.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.5.0",
+    "postcss": "^8.5.12",
+    "tailwindcss": "^3.4.19",
+    "vite": "^8.0.10"
+  }
+}
+</file>
+
+<file path="frontend/postcss.config.js">
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+</file>
+
+<file path="frontend/README.md">
+# React + Vite
+
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+
+Currently, two official plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+</file>
+
+<file path="frontend/tailwind.config.js">
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,jsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
+</file>
+
+<file path=".gitignore">
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+backend/.env
+docker/.env
+
+# Storage / uploads
+backend/storage/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker volumes / local data
+postgres_data/
+qdrant_data/
+
+# Node (future frontend)
+node_modules/
+dist/
+</file>
+
+<file path="README.md">
+# 🔍 AI-Powered Document Search Engine (RAG + Semantic Search)
+
+A full-stack AI application that enables users to upload documents, perform semantic search, and get context-aware answers using Retrieval-Augmented Generation (RAG).
+
+---
+
+## 🚀 Features
+
+### 🔐 Authentication
+- User registration & login (JWT-based)
+- Protected routes (frontend + backend)
+
+### 📂 Document Management
+- Upload PDF documents
+- Background processing (chunking + embeddings)
+- Real-time status updates (polling)
+- Delete documents
+
+### 🔎 Semantic Search
+- Vector-based search using embeddings
+- Retrieve relevant document chunks
+- Auto-load top result document
+- Page-level PDF rendering
+
+### 📄 PDF Viewer + Highlighting
+- Render PDF using `react-pdf`
+- Highlight matched content dynamically
+- Page navigation based on search results
+
+### 🤖 AI Search (RAG)
+- Ask natural language questions
+- Context-aware answer generation
+- Sources linked to document chunks
+
+---
+
+## 🧠 Tech Stack
+
+### Frontend
+- React (Vite)
+- Tailwind CSS
+- Zustand (state management)
+- React Router
+- Axios
+- React-PDF
+
+### Backend
+- FastAPI
+- PostgreSQL (SQLAlchemy ORM)
+- Qdrant (Vector DB)
+- Gemini API (Embeddings)
+- OpenAI (LLM for RAG)
+
+### Infrastructure
+- Docker (API + DB + Vector Store)
+
+---
+</file>
+
+<file path="backend/api/routes_documents.py">
+import os
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+
+from db.postgres import get_db
+from db.models import Document, Chunk ,User
+from core.deps import get_current_user
+from vector_store.qdrant_client import delete_document_vectors
+
+router = APIRouter(prefix="/api", tags=["documents"])
+
+@router.get("/documents")
+def list_documents(
+    user:User=Depends(get_current_user),
+    db: Session = Depends(get_db)):
+    docs = db.query(Document).filter(
+        Document.user_id==user.id).order_by(
+            Document.created_at.desc()).all()
+
+    return [
+        {
+            "doc_id": str(doc.doc_id),
+            "filename": str(doc.filename),
+            "status": str(doc.status),
+            "total_chunks": getattr(doc, "total_chunks", 0),
+            "created_at": doc.created_at,
+        }
+        for doc in docs
+    ]
+
+@router.get("/documents/{doc_id}/view")
+def view_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user:User=Depends(get_current_user)):
+    doc = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id==user.id).first()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    file_path = str(doc.path)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File missing on server")
+
+    return FileResponse(
+        path=file_path,
+        filename=str(doc.filename),
+        media_type="application/pdf"
+    )
+
+@router.delete("/documents/{doc_id}")
+def delete_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user:User=Depends(get_current_user)):
+    doc = db.query(Document).filter(Document.doc_id == doc_id,Document.user_id == user.id).first()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+        db.query(Chunk).filter(Chunk.doc_id == doc_id).delete()
+        delete_document_vectors(doc_id)
+
+        file_path = str(doc.path)
+        db.delete(doc)
+        db.commit()
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        return {
+            "message": "Document deleted successfully",
+            "doc_id": doc_id,
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+</file>
+
+<file path="backend/api/routes_search.py">
+import logging
+from typing import Optional, List, Dict
+
+from fastapi import APIRouter, HTTPException, Depends, Query
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from db.postgres import get_db
+from db.models import SearchLog, Document, User
+from core.deps import get_current_user
+
+from services.embedding import embed_query
+from vector_store.qdrant_client import search_vectors
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["search"])
+
+# Minimum similarity score — results below this are irrelevant and discarded
+MIN_SCORE = 0.50
+# Maximum number of results shown to the user
+MAX_RESULTS = 5
+
+
+# ---------------------------
+# RESPONSE MODELS
+# ---------------------------
+class SearchResult(BaseModel):
+    doc_id: str
+    filename: str
+    file_url: str
+    page_no: int
+    chunk_id: int
+    content: str
+    score: float
+    start_pos: int
+    end_pos: int
+
+
+class SearchResponse(BaseModel):
+    query: str
+    results: List[SearchResult]
+    total: int
+
+
+# ---------------------------
+# SEARCH API
+# ---------------------------
+@router.get("/search", response_model=SearchResponse)
+def search_documents(
+    q: str = Query(..., min_length=1),
+    doc_id: Optional[str] = Query(None),
+    top_k: int = Query(20, ge=1, le=50),   # fetch more from Qdrant so we have room to filter
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    # Step 1: Get user's documents
+    user_docs = db.query(Document).filter(
+        Document.user_id == user.id
+    ).all()
+
+    allowed_doc_ids = {str(doc.doc_id) for doc in user_docs}
+
+    # Optional: filter by specific doc_id
+    if doc_id:
+        if doc_id not in allowed_doc_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+        allowed_doc_ids = {doc_id}
+
+    # Step 2: Embed query
+    try:
+        query_vector = embed_query(q)
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
+        raise HTTPException(status_code=500, detail="Embedding failed")
+
+    # Step 3: Search vectors — fetch top_k so we have enough after score filtering
+    try:
+        hits = search_vectors(
+            query_vector=query_vector,
+            doc_id=None,
+            top_k=top_k
+        )
+    except Exception as e:
+        logger.error(f"Vector search failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+    # Step 4: Filter hits by user access AND minimum relevance score
+    filtered_hits = [
+        hit for hit in hits
+        if hit.payload
+        and str(hit.payload.get("doc_id")) in allowed_doc_ids
+        and float(hit.score) >= MIN_SCORE
+    ]
+
+    # Step 5: Build doc_map (NO extra DB query)
+    doc_map: Dict[str, str] = {
+        str(doc.doc_id): str(doc.filename)
+        for doc in user_docs
+    }
+
+    # Step 6: Build results, capped at MAX_RESULTS
+    results: List[SearchResult] = []
+
+    for hit in filtered_hits[:MAX_RESULTS]:
+        payload = hit.payload or {}
+        hit_doc_id = str(payload.get("doc_id", ""))
+
+        results.append(SearchResult(
+            doc_id=hit_doc_id,
+            filename=doc_map.get(hit_doc_id, "unknown"),
+            file_url=f"/api/documents/{hit_doc_id}/view",
+            page_no=int(payload.get("page_no", 0)),
+            chunk_id=int(payload.get("chunk_id", 0)),
+            content=str(payload.get("content", "")),
+            score=round(float(hit.score), 4),
+            start_pos=int(payload.get("start_pos", 0)),
+            end_pos=int(payload.get("end_pos", 0)),
+        ))
+
+    # Step 7: Log search
+    try:
+        db.add(SearchLog(
+            query=q,
+            doc_id=doc_id,
+            user_id=user.id,
+            results_count=len(results)
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return SearchResponse(
+        query=q,
+        results=results,
+        total=len(results)
+    )
+</file>
+
+<file path="backend/api/routes_upload.py">
+import os
+import logging
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks
+from sqlalchemy.orm import Session
+from core.deps import get_current_user
+from db.postgres import get_db
+from db.models import Document, User
+from utils.file_utils import validate_file, generate_doc_id, get_file_path
+from services.ingestion_service import process_document
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["documents"])
+
+
+@router.post("/upload")
+async def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    file_path = None
+    try:
+        contents = await file.read()
+        size = len(contents)
+
+        filename = file.filename
+        if not filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        ext = validate_file(filename, size)
+
+        doc_id = generate_doc_id()
+        file_path = get_file_path(doc_id, ext)
+
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        document = Document(
+            doc_id=doc_id,
+            filename=filename,
+            file_type=ext,
+            path=file_path,
+            status="pending",
+            user_id=user.id,
+        )
+        db.add(document)
+        db.commit()
+
+        background_tasks.add_task(process_document, doc_id, file_path)
+
+        return {
+            "doc_id": doc_id,
+            "filename": filename,
+            "status": "processing",
+            "message": "File uploaded. Poll /api/document/{doc_id}/status for completion.",
+        }
+
+    except ValueError as e:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except Exception as e:
+        db.rollback()
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+
+#added get_current_user dependency + ownership check
+@router.get("/document/{doc_id}/status")
+def get_document_status(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    document = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id == user.id, 
+    ).first()
+
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "doc_id": document.doc_id,
+        "filename": document.filename,
+        "status": document.status,
+        "total_chunks": document.total_chunks,
+        "created_at": document.created_at,
+    }
+</file>
+
+<file path="backend/core/config.py">
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Settings:
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
+    QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", 6333))
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
+    ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(
+        os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60)
+    )
+
+    EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", 3072))
+    QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "document_chunks")
+
+    def validate(self):
+        """
+        Called once at startup (from main.py lifespan).
+        Raises clearly if a critical key is missing so the developer
+        sees the problem immediately instead of a cryptic 500 later.
+        """
+        missing = []
+        if not self.DATABASE_URL:
+            missing.append("DATABASE_URL")
+        if not self.GEMINI_API_KEY:
+            missing.append("GEMINI_API_KEY")
+        if not self.OPENROUTER_API_KEY:
+            missing.append("OPENROUTER_API_KEY")
+        if not self.SECRET_KEY:
+            missing.append("SECRET_KEY")
+        if missing:
+            raise EnvironmentError(
+                f"Missing required environment variables: {', '.join(missing)}"
+            )
+
+
+settings = Settings()
+</file>
+
+<file path="backend/db/models.py">
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, Index,ForeignKey, UniqueConstraint
+from datetime import datetime, timezone
+from db.postgres import Base
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True,default=uuid.uuid4)
+    doc_id = Column(String, unique=True, index=True, nullable=False)
+    filename = Column(String, nullable=False)
+    file_type = Column(String, nullable=False)
+    path = Column(String, nullable=False)
+    status = Column(String, default="pending")  # pending | processing | completed | failed
+    total_chunks = Column(Integer, default=0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    user_id=Column(UUID(as_uuid=True),ForeignKey("users.id",ondelete='CASCADE'),nullable=False,index=True)
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+
+    id = Column(Integer, primary_key=True)
+    doc_id = Column(String, index=True, nullable=False)
+    page_no = Column(Integer, index=True, nullable=False)
+    chunk_id = Column(Integer, index=True, nullable=False)
+    content = Column(Text, nullable=False)
+    start_pos = Column(Integer)
+    end_pos = Column(Integer)
+    vector_id = Column(String)  # Qdrant point ID
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("idx_doc_page", "doc_id", "page_no"),
+        UniqueConstraint("doc_id", "page_no", "chunk_id", name="unique_doc_page_chunk"),
+    )
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True,default=uuid.uuid4)
+    username = Column(String, unique=True, nullable=False,index=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    is_verified = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class SearchLog(Base):
+    __tablename__ = "search_logs"
+
+    id = Column(Integer, primary_key=True)
+    query = Column(String, nullable=False)
+    doc_id = Column(String, nullable=True)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    results_count = Column(Integer, default=0)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+</file>
+
+<file path="backend/services/chunking.py">
+from typing import List, Dict
+
+
+def chunk_text(text: str, chunk_size: int = 250, overlap: int = 50) -> List[Dict]:
+    """
+    Splits text into overlapping word-level chunks.
+    Returns list of {"chunk_id", "content", "start_pos", "end_pos"}
+    """
+    words = text.split()
+    chunks = []
+    start = 0
+    chunk_id = 0
+
+    while start < len(words):
+        end = min(start + chunk_size, len(words))
+        chunk_words = words[start:end]
+
+        if not chunk_words:
+            break
+
+        chunks.append({
+            "chunk_id": chunk_id,
+            "content": " ".join(chunk_words),  # ← fixed: space between words
+            "start_pos": start,
+            "end_pos": end,
+        })
+
+        # ← fixed: these were outside the loop before
+        start += (chunk_size - overlap)
+        chunk_id += 1
+
+    return chunks
+</file>
+
+<file path="backend/vector_store/qdrant_client.py">
+import uuid
+import logging
+from typing import List, Dict, Optional, cast
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    ScoredPoint,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    PointIdsList,
+    ExtendedPointId,
+)
+
+from core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Shared Qdrant client
+client = QdrantClient(
+    host=settings.QDRANT_HOST,
+    port=settings.QDRANT_PORT,
+)
+
+COLLECTION = settings.QDRANT_COLLECTION
+DIM = settings.EMBEDDING_DIM
+
+
+def ensure_collection():
+    """
+    Create Qdrant collection if it does not already exist.
+    """
+    existing = [c.name for c in client.get_collections().collections]
+
+    if COLLECTION not in existing:
+        client.create_collection(
+            collection_name=COLLECTION,
+            vectors_config=VectorParams(
+                size=DIM,
+                distance=Distance.COSINE,
+            ),
+        )
+        logger.info(f"Created Qdrant collection: {COLLECTION}")
+    else:
+        logger.info(f"Qdrant collection already exists: {COLLECTION}")
+
+
+def upsert_vectors(points: List[Dict]):
+    """
+    Batch upsert chunk vectors into Qdrant.
+    Point IDs are stored as UUID strings and converted to uuid.UUID objects
+    for the Qdrant client so that rollback lookups work correctly.
+    """
+    if not points:
+        return
+
+    qdrant_points = [
+        PointStruct(
+            id=uuid.UUID(p["id"]),
+            vector=p["vector"],
+            payload=p["payload"],
+        )
+        for p in points
+    ]
+
+    batch_size = 100
+
+    for i in range(0, len(qdrant_points), batch_size):
+        batch = qdrant_points[i : i + batch_size]
+        client.upsert(
+            collection_name=COLLECTION,
+            points=batch,
+        )
+
+
+def delete_vectors_by_ids(vector_ids: List[str]):
+    """
+    Delete specific vectors by their UUID string point IDs.
+    Used for rollback if Postgres save fails after Qdrant upsert.
+    """
+    if not vector_ids:
+        return
+
+    try:
+        typed_ids: List[ExtendedPointId] = [uuid.UUID(vid) for vid in vector_ids]
+
+        client.delete(
+            collection_name=COLLECTION,
+            points_selector=PointIdsList(points=typed_ids),
+        )
+
+        logger.info(f"Rolled back {len(vector_ids)} vectors from Qdrant")
+
+    except Exception as e:
+        logger.error(f"Qdrant rollback failed: {e}")
+
+
+def delete_document_vectors(doc_id: str):
+    """
+    Delete all vectors belonging to a document.
+    Useful when deleting a document.
+    """
+    try:
+        client.delete(
+            collection_name=COLLECTION,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="doc_id",
+                        match=MatchValue(value=doc_id),
+                    )
+                ]
+            ),
+        )
+
+        logger.info(f"Deleted vectors for document: {doc_id}")
+
+    except Exception as e:
+        logger.error(f"Failed to delete vectors for doc {doc_id}: {e}")
+
+
+def search_vectors(
+    query_vector: List[float],
+    doc_id: Optional[str] = None,
+    top_k: int = 10,
+) -> List[ScoredPoint]:
+    """
+    Semantic vector search in Qdrant.
+    Optionally filter by document ID.
+    """
+    query_filter = None
+
+    if doc_id:
+        query_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="doc_id",
+                    match=MatchValue(value=doc_id),
+                )
+            ]
+        )
+
+    response = client.query_points(
+        collection_name=COLLECTION,
+        query=query_vector,
+        query_filter=query_filter,
+        limit=top_k,
+        with_payload=True,
+    )
+
+    return cast(List[ScoredPoint], response.points)
+</file>
+
+<file path="backend/requirements.txt">
+fastapi
+uvicorn[standard]
+python-dotenv
+psycopg2-binary
+sqlalchemy
+qdrant-client
+google-genai
+pymupdf
+pytesseract
+Pillow
+python-multipart
+pydantic
+python-dotenv
+openai>=1.0.0
+bcrypt==4.0.1
+passlib[bcrypt]
+python-jose[cryptography]
+</file>
+
+<file path="frontend/src/app/routes.jsx">
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom"
+import SearchPage from "../features/search/SearchPage"
+import AiSearchPage from "../features/rag/AiSearchPage"
+import LoginPage from "../features/auth/LoginPage"
+import RegisterPage from "../features/auth/RegisterPage"
+import ProtectedRoute from "./ProtectedRoute"
+
+export default function AppRoutes() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<RegisterPage />} />
+
+        <Route
+          path="/"
+          element={
+            <ProtectedRoute>
+              <SearchPage />
+            </ProtectedRoute>
+          }
+        />
+
+        <Route
+          path="/ai"
+          element={
+            <ProtectedRoute>
+              <AiSearchPage />
+            </ProtectedRoute>
+          }
+        />
+
+        {/* Catch-all */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
+  )
+}
+</file>
+
+<file path="frontend/src/features/auth/api.js">
+import api from "../../shared/utils/axios"
+
+export const loginUser = async (data) => {
+  const res = await api.post("/login", data)
+  return res.data
+}
+
+export const registerUser = async (data) => {
+  const res = await api.post("/register", data)
+  return res.data
+}
+
+export const logoutUser = () => {
+  localStorage.removeItem("token")
+}
+</file>
+
+<file path="frontend/src/features/auth/LoginPage.jsx">
+import { useState } from "react"
+import { loginUser } from "./api"
+import { useNavigate, Link } from "react-router-dom"
+import { toast } from "../../shared/utils/toast"
+
+export default function LoginPage() {
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [loading, setLoading] = useState(false)
+  const navigate = useNavigate()
+
+  const handleLogin = async () => {
+    if (!email.trim() || !password.trim()) {
+      toast.error("Please fill in all fields")
+      return
+    }
+
+    setLoading(true)
+    try {
+      const res = await loginUser({ email, password })
+      localStorage.setItem("token", res.access_token)
+      toast.success("Welcome back!")
+      navigate("/")
+    } catch (err) {
+      const msg = err.response?.data?.detail || "Invalid credentials"
+      toast.error(msg)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter") handleLogin()
+  }
+
+  return (
+    <div style={styles.page}>
+      {/* Background orb */}
+      <div style={styles.orb} />
+
+      <div style={styles.card}>
+        {/* Logo */}
+        <div style={styles.logo}>
+          <svg width="32" height="32" viewBox="0 0 48 46" fill="none">
+            <path fill="#7c6af7" d="M25.946 44.938c-.664.845-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.287c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.497 0-3.578-1.842-3.578H1.237c-.92 0-1.456-1.04-.92-1.788L10.013.474c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.579 1.842 3.579h11.377c.943 0 1.473 1.088.89 1.83L25.947 44.94z"/>
+          </svg>
+          <span style={styles.logoText}>DocSearch</span>
+        </div>
+
+        <h1 style={styles.heading}>Sign in</h1>
+        <p style={styles.subheading}>Access your document intelligence workspace</p>
+
+        <div style={styles.form}>
+          <div style={styles.field}>
+            <label style={styles.label}>Email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="you@example.com"
+              style={styles.input}
+              autoComplete="email"
+              autoFocus
+            />
+          </div>
+
+          <div style={styles.field}>
+            <label style={styles.label}>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="••••••••"
+              style={styles.input}
+              autoComplete="current-password"
+            />
+          </div>
+
+          <button
+            onClick={handleLogin}
+            disabled={loading}
+            style={{
+              ...styles.btn,
+              opacity: loading ? 0.7 : 1,
+              cursor: loading ? "not-allowed" : "pointer",
+            }}
+          >
+            {loading ? (
+              <span style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "center" }}>
+                <span style={styles.spinner} />
+                Signing in...
+              </span>
+            ) : (
+              "Sign in"
+            )}
+          </button>
+        </div>
+
+        <p style={styles.footer}>
+          Don&apos;t have an account?{" "}
+          <Link to="/register" style={styles.link}>
+            Create one
+          </Link>
+        </p>
+      </div>
+    </div>
+  )
+}
+
+const styles = {
+  page: {
+    minHeight: "100vh",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "var(--bg-primary)",
+    position: "relative",
+    overflow: "hidden",
+  },
+  orb: {
+    position: "absolute",
+    width: 500,
+    height: 500,
+    borderRadius: "50%",
+    background: "radial-gradient(circle, rgba(124,106,247,0.15) 0%, transparent 70%)",
+    top: "50%",
+    left: "50%",
+    transform: "translate(-50%, -50%)",
+    pointerEvents: "none",
+  },
+  card: {
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: 20,
+    padding: "40px 44px",
+    width: "100%",
+    maxWidth: 420,
+    position: "relative",
+    boxShadow: "0 24px 80px rgba(0,0,0,0.5)",
+  },
+  logo: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 28,
+  },
+  logoText: {
+    fontSize: 18,
+    fontWeight: 700,
+    color: "var(--text-primary)",
+    letterSpacing: "-0.02em",
+  },
+  heading: {
+    fontSize: 26,
+    fontWeight: 700,
+    color: "var(--text-primary)",
+    margin: "0 0 6px",
+    letterSpacing: "-0.03em",
+  },
+  subheading: {
+    fontSize: 14,
+    color: "var(--text-secondary)",
+    margin: "0 0 28px",
+  },
+  form: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 16,
+  },
+  field: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  label: {
+    fontSize: 13,
+    fontWeight: 500,
+    color: "var(--text-secondary)",
+    letterSpacing: "0.01em",
+  },
+  input: {
+    background: "var(--bg-secondary)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "11px 14px",
+    fontSize: 14,
+    color: "var(--text-primary)",
+    outline: "none",
+    transition: "border-color 0.15s",
+    fontFamily: "inherit",
+  },
+  btn: {
+    background: "var(--accent)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 10,
+    padding: "12px 0",
+    fontSize: 14,
+    fontWeight: 600,
+    width: "100%",
+    marginTop: 4,
+    fontFamily: "inherit",
+    transition: "background 0.15s, transform 0.1s",
+    letterSpacing: "0.01em",
+  },
+  spinner: {
+    width: 14,
+    height: 14,
+    border: "2px solid rgba(255,255,255,0.3)",
+    borderTopColor: "#fff",
+    borderRadius: "50%",
+    display: "inline-block",
+    animation: "spin 0.8s linear infinite",
+  },
+  footer: {
+    marginTop: 24,
+    fontSize: 13,
+    color: "var(--text-secondary)",
+    textAlign: "center",
+  },
+  link: {
+    color: "var(--accent-hover)",
+    textDecoration: "none",
+    fontWeight: 500,
+  },
+}
+</file>
+
+<file path="frontend/src/features/auth/RegisterPage.jsx">
+import { useState } from "react"
+import { registerUser } from "./api"
+import { useNavigate, Link } from "react-router-dom"
+import { toast } from "../../shared/utils/toast"
+
+export default function RegisterPage() {
+  const [username, setUsername] = useState("")
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [loading, setLoading] = useState(false)
+  const navigate = useNavigate()
+
+  const handleRegister = async () => {
+    if (!username.trim() || !email.trim() || !password.trim()) {
+      toast.error("Please fill in all fields")
+      return
+    }
+    if (password.length < 6) {
+      toast.error("Password must be at least 6 characters")
+      return
+    }
+
+    setLoading(true)
+    try {
+      await registerUser({ username, email, password })
+      toast.success("Account created! Please sign in.")
+      navigate("/login")
+    } catch (err) {
+      const msg = err.response?.data?.detail || "Registration failed"
+      toast.error(msg)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter") handleRegister()
+  }
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.orb} />
+
+      <div style={styles.card}>
+        <div style={styles.logo}>
+          <svg width="32" height="32" viewBox="0 0 48 46" fill="none">
+            <path fill="#7c6af7" d="M25.946 44.938c-.664.845-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.287c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.497 0-3.578-1.842-3.578H1.237c-.92 0-1.456-1.04-.92-1.788L10.013.474c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.579 1.842 3.579h11.377c.943 0 1.473 1.088.89 1.83L25.947 44.94z"/>
+          </svg>
+          <span style={styles.logoText}>DocSearch</span>
+        </div>
+
+        <h1 style={styles.heading}>Create account</h1>
+        <p style={styles.subheading}>Start searching your documents intelligently</p>
+
+        <div style={styles.form}>
+          <div style={styles.field}>
+            <label style={styles.label}>Username</label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="johndoe"
+              style={styles.input}
+              autoFocus
+            />
+          </div>
+
+          <div style={styles.field}>
+            <label style={styles.label}>Email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="you@example.com"
+              style={styles.input}
+            />
+          </div>
+
+          <div style={styles.field}>
+            <label style={styles.label}>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Min. 6 characters"
+              style={styles.input}
+            />
+          </div>
+
+          <button
+            onClick={handleRegister}
+            disabled={loading}
+            style={{
+              ...styles.btn,
+              opacity: loading ? 0.7 : 1,
+              cursor: loading ? "not-allowed" : "pointer",
+            }}
+          >
+            {loading ? (
+              <span style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "center" }}>
+                <span style={styles.spinner} />
+                Creating account...
+              </span>
+            ) : (
+              "Create account"
+            )}
+          </button>
+        </div>
+
+        <p style={styles.footer}>
+          Already have an account?{" "}
+          <Link to="/login" style={styles.link}>
+            Sign in
+          </Link>
+        </p>
+      </div>
+    </div>
+  )
+}
+
+const styles = {
+  page: {
+    minHeight: "100vh",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "var(--bg-primary)",
+    position: "relative",
+    overflow: "hidden",
+  },
+  orb: {
+    position: "absolute",
+    width: 500,
+    height: 500,
+    borderRadius: "50%",
+    background: "radial-gradient(circle, rgba(124,106,247,0.15) 0%, transparent 70%)",
+    top: "50%",
+    left: "50%",
+    transform: "translate(-50%, -50%)",
+    pointerEvents: "none",
+  },
+  card: {
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: 20,
+    padding: "40px 44px",
+    width: "100%",
+    maxWidth: 420,
+    position: "relative",
+    boxShadow: "0 24px 80px rgba(0,0,0,0.5)",
+  },
+  logo: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 28,
+  },
+  logoText: {
+    fontSize: 18,
+    fontWeight: 700,
+    color: "var(--text-primary)",
+    letterSpacing: "-0.02em",
+  },
+  heading: {
+    fontSize: 26,
+    fontWeight: 700,
+    color: "var(--text-primary)",
+    margin: "0 0 6px",
+    letterSpacing: "-0.03em",
+  },
+  subheading: {
+    fontSize: 14,
+    color: "var(--text-secondary)",
+    margin: "0 0 28px",
+  },
+  form: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 16,
+  },
+  field: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  label: {
+    fontSize: 13,
+    fontWeight: 500,
+    color: "var(--text-secondary)",
+    letterSpacing: "0.01em",
+  },
+  input: {
+    background: "var(--bg-secondary)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "11px 14px",
+    fontSize: 14,
+    color: "var(--text-primary)",
+    outline: "none",
+    fontFamily: "inherit",
+  },
+  btn: {
+    background: "var(--accent)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 10,
+    padding: "12px 0",
+    fontSize: 14,
+    fontWeight: 600,
+    width: "100%",
+    marginTop: 4,
+    fontFamily: "inherit",
+    letterSpacing: "0.01em",
+  },
+  spinner: {
+    width: 14,
+    height: 14,
+    border: "2px solid rgba(255,255,255,0.3)",
+    borderTopColor: "#fff",
+    borderRadius: "50%",
+    display: "inline-block",
+    animation: "spin 0.8s linear infinite",
+  },
+  footer: {
+    marginTop: 24,
+    fontSize: 13,
+    color: "var(--text-secondary)",
+    textAlign: "center",
+  },
+  link: {
+    color: "var(--accent-hover)",
+    textDecoration: "none",
+    fontWeight: 500,
+  },
+}
+</file>
+
+<file path="frontend/src/features/documents/DocumentList.jsx">
+import { useEffect, useState } from "react"
+import { fetchDocuments, deleteDocument } from "./api"
+import { useDocumentStore } from "../../store/documentStore"
+import { toast } from "../../shared/utils/toast"
+
+export default function DocumentList() {
+  const { documents, setDocuments, setSelectedDoc, selectedDoc, removeDocument } =
+    useDocumentStore()
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const data = await fetchDocuments()
+        setDocuments(data)
+      } catch {
+        toast.error("Failed to load documents")
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [])
+
+  const handleDelete = async (e, docId) => {
+    e.stopPropagation()
+    try {
+      await deleteDocument(docId)
+      removeDocument(docId)
+      toast.success("Document deleted")
+    } catch {
+      toast.error("Delete failed")
+    }
+  }
+
+  if (loading) {
+    return (
+      <div style={styles.loading}>
+        {[1, 2, 3].map((i) => (
+          <div key={i} className="shimmer" style={styles.skeleton} />
+        ))}
+      </div>
+    )
+  }
+
+  if (!documents.length) {
+    return (
+      <div style={styles.empty}>
+        <svg width="32" height="32" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1} style={{ color: "var(--text-muted)" }}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+        </svg>
+        <p style={styles.emptyText}>No documents yet</p>
+        <p style={styles.emptySubText}>Upload a PDF to get started</p>
+      </div>
+    )
+  }
+
+  return (
+    <div style={styles.list}>
+      {documents.map((doc) => {
+        const isSelected = selectedDoc?.doc_id === doc.doc_id
+        return (
+          <div
+            key={doc.doc_id}
+            style={{
+              ...styles.item,
+              ...(isSelected ? styles.itemSelected : {}),
+            }}
+            onClick={() => setSelectedDoc(doc)}
+          >
+            <div style={styles.docIcon}>
+              <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+              </svg>
+            </div>
+
+            <div style={styles.docInfo}>
+              <div style={styles.docName} title={doc.filename}>
+                {doc.filename}
+              </div>
+              <div style={styles.docMeta}>
+                <span className={`status-badge status-${doc.status}`}>
+                  {doc.status}
+                </span>
+                {doc.total_chunks > 0 && (
+                  <span style={styles.chunks}>{doc.total_chunks} chunks</span>
+                )}
+              </div>
+            </div>
+
+            <button
+              onClick={(e) => handleDelete(e, doc.doc_id)}
+              style={styles.deleteBtn}
+              title="Delete document"
+            >
+              <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+const styles = {
+  list: { display: "flex", flexDirection: "column", gap: 2 },
+  loading: { display: "flex", flexDirection: "column", gap: 6, padding: "4px 0" },
+  skeleton: { height: 56, borderRadius: 10 },
+  empty: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "32px 16px",
+    gap: 6,
+  },
+  emptyText: { fontSize: 13, fontWeight: 500, color: "var(--text-secondary)", margin: 0 },
+  emptySubText: { fontSize: 12, color: "var(--text-muted)", margin: 0, textAlign: "center" },
+  item: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 8px",
+    borderRadius: 10,
+    cursor: "pointer",
+    transition: "background 0.12s",
+    border: "1px solid transparent",
+    minWidth: 0,
+  },
+  itemSelected: {
+    background: "var(--accent-glow)",
+    border: "1px solid rgba(124,106,247,0.25)",
+  },
+  docIcon: {
+    width: 30,
+    height: 30,
+    background: "var(--bg-card)",
+    borderRadius: 7,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+    color: "var(--text-muted)",
+  },
+  docInfo: {
+    flex: 1,
+    minWidth: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: 3,
+  },
+  docName: {
+    fontSize: 12,
+    fontWeight: 500,
+    color: "var(--text-primary)",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    lineHeight: 1.3,
+  },
+  docMeta: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    flexWrap: "wrap",
+  },
+  chunks: {
+    fontSize: 10,
+    color: "var(--text-muted)",
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  deleteBtn: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: 24,
+    height: 24,
+    background: "transparent",
+    border: "none",
+    borderRadius: 6,
+    cursor: "pointer",
+    color: "var(--text-muted)",
+    flexShrink: 0,
+    transition: "all 0.12s",
+    padding: 0,
+  },
+}
+</file>
+
+<file path="frontend/src/features/documents/Sidebar.jsx">
+import DocumentList from "./DocumentList"
+import UploadButton from "./UploadButton"
+
+export default function Sidebar() {
+  return (
+    <div style={styles.sidebar}>
+      <div style={styles.header}>
+        <span style={styles.title}>Documents</span>
+      </div>
+
+      <div style={styles.uploadArea}>
+        <UploadButton />
+      </div>
+
+      <div style={styles.listArea}>
+        <DocumentList />
+      </div>
+    </div>
+  )
+}
+
+const styles = {
+  sidebar: {
+    display: "flex",
+    flexDirection: "column",
+    height: "100%",
+    background: "var(--bg-secondary)",
+    overflow: "hidden",
+  },
+  header: {
+    padding: "18px 16px 12px",
+    borderBottom: "1px solid var(--border)",
+    flexShrink: 0,
+  },
+  title: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: "var(--text-muted)",
+    letterSpacing: "0.08em",
+    textTransform: "uppercase",
+  },
+  uploadArea: {
+    padding: "12px 12px 8px",
+    flexShrink: 0,
+  },
+  listArea: {
+    flex: 1,
+    overflowY: "auto",
+    padding: "4px 8px 16px",
+  },
+}
+</file>
+
+<file path="frontend/src/features/documents/UploadButton.jsx">
+import { useRef, useState } from "react"
+import { uploadDocument, getDocumentStatus, fetchDocuments } from "./api"
+import { useDocumentStore } from "../../store/documentStore"
+import { toast } from "../../shared/utils/toast"
+
+export default function UploadButton() {
+  const { setDocuments, updateDocumentStatus } = useDocumentStore()
+  const inputRef = useRef(null)
+  const [uploading, setUploading] = useState(false)
+
+  const handleUpload = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    // Reset input so same file can be re-uploaded
+    e.target.value = ""
+
+    setUploading(true)
+
+    try {
+      const res = await uploadDocument(file)
+      const docId = res.doc_id
+
+      toast.info(`Uploading ${file.name}...`)
+
+      // Add optimistically
+      const currentDocs = useDocumentStore.getState().documents
+      setDocuments([
+        { doc_id: docId, filename: file.name, status: "processing", total_chunks: 0 },
+        ...currentDocs,
+      ])
+
+      // Poll for completion
+      const interval = setInterval(async () => {
+        try {
+          const statusRes = await getDocumentStatus(docId)
+          updateDocumentStatus(docId, statusRes.status)
+
+          if (statusRes.status === "completed") {
+            clearInterval(interval)
+            toast.success(`${file.name} processed successfully`)
+            const updatedDocs = await fetchDocuments()
+            setDocuments(updatedDocs)
+          } else if (statusRes.status === "failed") {
+            clearInterval(interval)
+            toast.error(`Processing failed for ${file.name}`)
+          }
+        } catch {
+          clearInterval(interval)
+        }
+      }, 2000)
+    } catch (err) {
+      const msg = err.response?.data?.detail || "Upload failed"
+      toast.error(msg)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  return (
+    <>
+      <input
+        ref={inputRef}
+        type="file"
+        accept=".pdf"
+        onChange={handleUpload}
+        style={{ display: "none" }}
+      />
+      <button
+        onClick={() => inputRef.current?.click()}
+        disabled={uploading}
+        style={{
+          ...styles.btn,
+          opacity: uploading ? 0.7 : 1,
+          cursor: uploading ? "not-allowed" : "pointer",
+        }}
+      >
+        {uploading ? (
+          <>
+            <span style={styles.spinner} />
+            Uploading...
+          </>
+        ) : (
+          <>
+            <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 16.5V9.75m0 0 3 3m-3-3-3 3M6.75 19.5a4.5 4.5 0 0 1-1.41-8.775 5.25 5.25 0 0 1 10.233-2.33 3 3 0 0 1 3.758 3.848A3.752 3.752 0 0 1 18 19.5H6.75Z" />
+            </svg>
+            Upload PDF
+          </>
+        )}
+      </button>
+    </>
+  )
+}
+
+const styles = {
+  btn: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 7,
+    width: "100%",
+    padding: "9px 0",
+    background: "var(--accent-glow)",
+    border: "1px dashed rgba(124,106,247,0.4)",
+    borderRadius: 10,
+    color: "var(--accent-hover)",
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: "inherit",
+    transition: "all 0.15s",
+    letterSpacing: "0.01em",
+  },
+  spinner: {
+    width: 12,
+    height: 12,
+    border: "2px solid rgba(149,133,255,0.3)",
+    borderTopColor: "var(--accent-hover)",
+    borderRadius: "50%",
+    display: "inline-block",
+    animation: "spin 0.8s linear infinite",
+  },
+}
+</file>
+
+<file path="frontend/src/features/rag/AiSearchPage.jsx">
+import { useState } from "react"
+import { aiSearch } from "./api"
+import useRag from "../../hooks/useRag"
+import AnswerPanel from "./AnswerPanel"
+import MainLayout from "../../shared/layout/MainLayout"
+import Sidebar from "../documents/Sidebar"
+import { toast } from "../../shared/utils/toast"
+
+export default function AiSearchPage() {
+  const [query, setQuery] = useState("")
+  const { answer, setAnswer, sources, setSources, loading, setLoading, reset } = useRag()
+  const [hasSearched, setHasSearched] = useState(false)
+
+  const handleSearch = async () => {
+    const q = query.trim()
+    if (!q) return
+
+    reset()
+    setLoading(true)
+    setHasSearched(true)
+
+    try {
+      const res = await aiSearch(q)
+      setAnswer(res.answer)
+      setSources(res.sources)
+    } catch (err) {
+      toast.error("AI search failed. Please try again.")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) handleSearch()
+  }
+
+  return (
+    <MainLayout sidebar={<Sidebar />}>
+      <div style={styles.page}>
+        {/* Header */}
+        <div style={styles.header}>
+          <div style={styles.titleRow}>
+            <div style={styles.aiDot} />
+            <h2 style={styles.title}>AI Ask</h2>
+          </div>
+          <p style={styles.subtitle}>Ask questions in natural language — get answers extracted from your documents.</p>
+
+          {/* Search input */}
+          <div style={styles.inputRow}>
+            <div style={styles.textareaWrap}>
+              <textarea
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ask anything about your documents..."
+                style={styles.textarea}
+                rows={2}
+              />
+            </div>
+            <button
+              onClick={handleSearch}
+              disabled={loading || !query.trim()}
+              style={{
+                ...styles.askBtn,
+                opacity: (loading || !query.trim()) ? 0.6 : 1,
+                cursor: (loading || !query.trim()) ? "not-allowed" : "pointer",
+              }}
+            >
+              {loading ? (
+                <span style={styles.spinner} />
+              ) : (
+                <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
+                </svg>
+              )}
+            </button>
+          </div>
+          <p style={styles.hint}>Press Enter to send · Shift+Enter for new line</p>
+        </div>
+
+        {/* Answer panel */}
+        <div style={styles.answerArea}>
+          <AnswerPanel answer={answer} sources={sources} loading={loading} hasSearched={hasSearched} />
+        </div>
+      </div>
+    </MainLayout>
+  )
+}
+
+const styles = {
+  page: {
+    display: "flex",
+    flexDirection: "column",
+    height: "100%",
+    overflow: "hidden",
+  },
+  header: {
+    padding: "24px 28px 20px",
+    borderBottom: "1px solid var(--border)",
+    flexShrink: 0,
+  },
+  titleRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 4,
+  },
+  aiDot: {
+    width: 8,
+    height: 8,
+    borderRadius: "50%",
+    background: "var(--accent)",
+    boxShadow: "0 0 8px var(--accent)",
+  },
+  title: {
+    fontSize: 18,
+    fontWeight: 700,
+    color: "var(--text-primary)",
+    margin: 0,
+    letterSpacing: "-0.02em",
+  },
+  subtitle: {
+    fontSize: 13,
+    color: "var(--text-muted)",
+    margin: "0 0 16px",
+  },
+  inputRow: {
+    display: "flex",
+    gap: 10,
+    alignItems: "flex-end",
+  },
+  textareaWrap: {
+    flex: 1,
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: 14,
+    overflow: "hidden",
+    transition: "border-color 0.15s",
+  },
+  textarea: {
+    width: "100%",
+    background: "transparent",
+    border: "none",
+    outline: "none",
+    padding: "13px 16px",
+    fontSize: 14,
+    color: "var(--text-primary)",
+    fontFamily: "inherit",
+    resize: "none",
+    lineHeight: 1.5,
+  },
+  askBtn: {
+    width: 44,
+    height: 44,
+    background: "var(--accent)",
+    border: "none",
+    borderRadius: 12,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    color: "#fff",
+    flexShrink: 0,
+    transition: "background 0.15s",
+  },
+  spinner: {
+    width: 16,
+    height: 16,
+    border: "2px solid rgba(255,255,255,0.3)",
+    borderTopColor: "#fff",
+    borderRadius: "50%",
+    display: "inline-block",
+    animation: "spin 0.8s linear infinite",
+  },
+  hint: {
+    fontSize: 11,
+    color: "var(--text-muted)",
+    margin: "8px 0 0",
+  },
+  answerArea: {
+    flex: 1,
+    overflow: "auto",
+    padding: "20px 28px",
+  },
+}
+</file>
+
+<file path="frontend/src/features/rag/AnswerPanel.jsx">
+export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
+  if (!hasSearched) {
+    return (
+      <div style={styles.emptyState}>
+        <div style={styles.emptyIcon}>
+          <svg width="40" height="40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={0.8}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09Z" />
+          </svg>
+        </div>
+        <p style={styles.emptyTitle}>Ask your documents anything</p>
+        <p style={styles.emptyDesc}>Type a question above. The AI will search your documents and provide an answer with source references.</p>
+        <div style={styles.examples}>
+          <p style={styles.examplesLabel}>Example questions:</p>
+          {["What are the main findings in this report?", "What skills does the candidate have?", "What is the project timeline and budget?"].map((ex, i) => (
+            <div key={i} style={styles.example}>&ldquo;{ex}&rdquo;</div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  if (loading) {
+    return (
+      <div style={styles.loadingState}>
+        <div style={styles.loadingPulse} />
+        <div style={styles.loadingLines}>
+          <div className="shimmer" style={{ ...styles.loadLine, width: "85%" }} />
+          <div className="shimmer" style={{ ...styles.loadLine, width: "70%" }} />
+          <div className="shimmer" style={{ ...styles.loadLine, width: "80%" }} />
+        </div>
+        <p style={styles.loadingText}>Searching documents and generating answer...</p>
+      </div>
+    )
+  }
+
+  return (
+    <div style={styles.container} className="fade-in">
+      {/* Answer card */}
+      <div style={styles.answerCard}>
+        <div style={styles.answerHeader}>
+          <div style={styles.answerBadge}>
+            <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09Z" />
+            </svg>
+            AI Answer
+          </div>
+        </div>
+        <p style={styles.answerText}>{answer}</p>
+      </div>
+
+      {/* Sources */}
+      {sources && sources.length > 0 && (
+        <div style={styles.sourcesSection}>
+          <h3 style={styles.sourcesTitle}>
+            <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13.19 8.688a4.5 4.5 0 0 1 1.242 7.244l-4.5 4.5a4.5 4.5 0 0 1-6.364-6.364l1.757-1.757m13.35-.622 1.757-1.757a4.5 4.5 0 0 0-6.364-6.364l-4.5 4.5a4.5 4.5 0 0 0 1.242 7.244" />
+            </svg>
+            Sources ({sources.length})
+          </h3>
+          <div style={styles.sourcesList}>
+            {sources.map((s, i) => (
+              <div key={i} style={styles.sourceCard}>
+                <div style={styles.sourceHeader}>
+                  <div style={styles.sourceFile}>
+                    <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+                    </svg>
+                    {s.filename}
+                  </div>
+                  <div style={styles.sourceTags}>
+                    <span style={styles.pageTag}>p.{s.page_no}</span>
+                    <span style={styles.scoreTag}>{(s.score * 100).toFixed(0)}%</span>
+                  </div>
+                </div>
+                <p style={styles.sourceExcerpt}>
+                  {s.content.slice(0, 200)}{s.content.length > 200 ? "…" : ""}
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const styles = {
+  container: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 20,
+    maxWidth: 800,
+  },
+  emptyState: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    padding: "40px 20px",
+    color: "var(--text-muted)",
+    maxWidth: 480,
+    margin: "0 auto",
+  },
+  emptyIcon: {
+    width: 72,
+    height: 72,
+    background: "var(--bg-card)",
+    borderRadius: 20,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 4,
+    color: "var(--border-light)",
+  },
+  emptyTitle: {
+    fontSize: 15,
+    fontWeight: 600,
+    color: "var(--text-secondary)",
+    margin: 0,
+  },
+  emptyDesc: {
+    fontSize: 13,
+    color: "var(--text-muted)",
+    textAlign: "center",
+    lineHeight: 1.6,
+    margin: 0,
+  },
+  examples: {
+    marginTop: 16,
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    width: "100%",
+  },
+  examplesLabel: {
+    fontSize: 11,
+    color: "var(--text-muted)",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+    fontWeight: 600,
+    margin: "0 0 4px",
+  },
+  example: {
+    fontSize: 12,
+    color: "var(--text-secondary)",
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: 8,
+    padding: "8px 12px",
+    fontStyle: "italic",
+    lineHeight: 1.4,
+  },
+  loadingState: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+    padding: "20px 0",
+    maxWidth: 600,
+  },
+  loadingPulse: {
+    width: 40,
+    height: 40,
+    borderRadius: "50%",
+    background: "var(--accent-glow)",
+    border: "2px solid var(--accent)",
+    animation: "spin 1s linear infinite",
+    marginBottom: 4,
+  },
+  loadingLines: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+  },
+  loadLine: {
+    height: 16,
+    borderRadius: 8,
+  },
+  loadingText: {
+    fontSize: 13,
+    color: "var(--text-muted)",
+    margin: 0,
+  },
+  answerCard: {
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: 16,
+    padding: "20px 24px",
+    borderLeft: "3px solid var(--accent)",
+  },
+  answerHeader: {
+    marginBottom: 14,
+  },
+  answerBadge: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "4px 10px",
+    background: "var(--accent-glow)",
+    borderRadius: 100,
+    fontSize: 11,
+    fontWeight: 600,
+    color: "var(--accent-hover)",
+    letterSpacing: "0.02em",
+    textTransform: "uppercase",
+  },
+  answerText: {
+    fontSize: 14,
+    color: "var(--text-primary)",
+    lineHeight: 1.7,
+    margin: 0,
+    whiteSpace: "pre-line",
+  },
+  sourcesSection: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  },
+  sourcesTitle: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 12,
+    fontWeight: 600,
+    color: "var(--text-muted)",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+    margin: 0,
+  },
+  sourcesList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+  },
+  sourceCard: {
+    background: "var(--bg-secondary)",
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "12px 16px",
+  },
+  sourceHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+    gap: 8,
+  },
+  sourceFile: {
+    display: "flex",
+    alignItems: "center",
+    gap: 5,
+    fontSize: 11,
+    fontWeight: 600,
+    color: "var(--text-secondary)",
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    flex: 1,
+    minWidth: 0,
+  },
+  sourceTags: {
+    display: "flex",
+    gap: 4,
+    flexShrink: 0,
+  },
+  pageTag: {
+    padding: "2px 7px",
+    background: "var(--bg-hover)",
+    borderRadius: 6,
+    fontSize: 11,
+    color: "var(--text-muted)",
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  scoreTag: {
+    padding: "2px 7px",
+    background: "var(--accent-glow)",
+    borderRadius: 6,
+    fontSize: 11,
+    color: "var(--accent-hover)",
+    fontFamily: "'JetBrains Mono', monospace",
+    fontWeight: 600,
+  },
+  sourceExcerpt: {
+    fontSize: 12,
+    color: "var(--text-muted)",
+    lineHeight: 1.6,
+    margin: 0,
+  },
+}
+</file>
+
+<file path="frontend/src/features/search/PDFViewer.jsx">
+import { Document, Page, pdfjs } from "react-pdf"
+import { useState, useMemo, useRef, useCallback, memo, useEffect } from "react"
+import "react-pdf/dist/Page/TextLayer.css"
+import "react-pdf/dist/Page/AnnotationLayer.css"
+import HighlightLayer from "./HighlightLayer"
+
+pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`
+
+// ─── Hook: watch container width via ResizeObserver ──────────────────────────
+function useContainerWidth(ref) {
+  const [width, setWidth] = useState(600)
+
+  useEffect(() => {
+    if (!ref.current) return
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = Math.floor(entry.contentRect.width)
+        if (w > 0) setWidth(w)
+      }
+    })
+    ro.observe(ref.current)
+    const initial = Math.floor(ref.current.getBoundingClientRect().width)
+    if (initial > 0) setWidth(initial)
+    return () => ro.disconnect()
+  }, [ref])
+
+  return width
+}
+
+// ─── Single document viewer ───────────────────────────────────────────────────
+function SingleDocViewer({ docResults, query, activePage, fileProp }) {
+  const containerRef = useRef(null)
+  const pageWrapperRef = useRef(null)
+  const containerWidth = useContainerWidth(containerRef)
+
+  const [numPages, setNumPages] = useState(null)
+  const [pageNum, setPageNum] = useState(docResults[0]?.page_no || 1)
+  const [pageReady, setPageReady] = useState(false)
+  const [renderedSize, setRenderedSize] = useState(null)
+
+  // Track whether we've set the initial page for this document load
+  const initializedRef = useRef(false)
+
+  // Pages that have search results
+  const resultPages = useMemo(
+    () => [...new Set(docResults.map((r) => r.page_no))].sort((a, b) => a - b),
+    [docResults]
+  )
+
+  // OCR/extracted text for the currently viewed page (for image PDF highlight fallback)
+  const chunkText = useMemo(() => {
+    const chunks = docResults.filter((r) => r.page_no === pageNum)
+    return chunks.map((r) => r.content).join(" ")
+  }, [docResults, pageNum])
+
+  // Sync to activePage prop (result card clicks from SearchPage)
+  useEffect(() => {
+    if (activePage && activePage !== pageNum) {
+      setPageReady(false)
+      setRenderedSize(null)
+      setPageNum(activePage)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePage])
+
+  // Called once when PDF loads — only set page on first load
+  const handleLoadSuccess = useCallback(({ numPages: n }) => {
+    setNumPages(n)
+    if (!initializedRef.current) {
+      initializedRef.current = true
+      // Don't reset pageNum here — activePage useEffect handles it
+    }
+    setPageReady(false)
+    setRenderedSize(null)
+  }, [])
+
+  // After page renders, measure the actual canvas pixel size for highlight coord mapping
+  const handleRenderSuccess = useCallback(() => {
+    setPageReady(true)
+    if (pageWrapperRef.current) {
+      const canvas = pageWrapperRef.current.querySelector("canvas")
+      if (canvas) {
+        const rect = canvas.getBoundingClientRect()
+        if (rect.width > 0 && rect.height > 0) {
+          setRenderedSize({ width: rect.width, height: rect.height })
+        }
+      }
+    }
+  }, [])
+
+  const goToPage = useCallback((p) => {
+    setPageReady(false)
+    setRenderedSize(null)
+    setPageNum(p)
+  }, [])
+
+  const handlePrev = useCallback(
+    () => goToPage(Math.max(1, pageNum - 1)),
+    [pageNum, goToPage]
+  )
+
+  const handleNext = useCallback(
+    () => goToPage(Math.min(numPages || 1, pageNum + 1)),
+    [pageNum, numPages, goToPage]
+  )
+
+  return (
+    <div style={styles.docViewer} ref={containerRef}>
+
+      {/* Result page jump buttons */}
+      {resultPages.length > 0 && (
+        <div style={styles.jumpBar}>
+          <span style={styles.jumpLabel}>Results on pages:</span>
+          {resultPages.map((p) => (
+            <button
+              key={p}
+              onClick={() => goToPage(p)}
+              style={{
+                ...styles.jumpBtn,
+                background: pageNum === p ? "var(--accent)" : "var(--bg-hover)",
+                color: pageNum === p ? "#fff" : "var(--text-secondary)",
+              }}
+            >
+              p.{p}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* PDF Document — fileProp is memoized so this never reloads unexpectedly */}
+      <Document
+        file={fileProp}
+        onLoadSuccess={handleLoadSuccess}
+        onLoadError={(err) => console.error("PDF load error:", err)}
+        loading={<div style={styles.msg}>Loading PDF…</div>}
+        error={<div style={styles.msg}>Failed to load PDF.</div>}
+      >
+        {/* position:relative is CRITICAL — canvas overlay uses position:absolute */}
+        <div style={styles.pageWrapper} ref={pageWrapperRef}>
+          <Page
+            pageNumber={pageNum}
+            width={containerWidth > 0 ? containerWidth : undefined}
+            renderTextLayer={true}
+            renderAnnotationLayer={true}
+            onRenderSuccess={handleRenderSuccess}
+            loading={<div style={styles.msg}>Rendering page…</div>}
+          />
+          {pageReady && renderedSize && (
+            <HighlightLayer
+              fileProp={fileProp}
+              pageNum={pageNum}
+              query={query}
+              renderedSize={renderedSize}
+              chunkText={chunkText}
+            />
+          )}
+        </div>
+      </Document>
+
+      {/* Pagination — show as soon as numPages is known */}
+      {numPages != null && (
+        <div style={styles.pagination}>
+          <button
+            onClick={handlePrev}
+            disabled={pageNum <= 1}
+            style={{
+              ...styles.pageBtn,
+              opacity: pageNum <= 1 ? 0.35 : 1,
+              cursor: pageNum <= 1 ? "not-allowed" : "pointer",
+            }}
+          >
+            ‹ Prev
+          </button>
+          <span style={styles.pageInfo}>
+            {pageNum} / {numPages}
+          </span>
+          <button
+            onClick={handleNext}
+            disabled={pageNum >= numPages}
+            style={{
+              ...styles.pageBtn,
+              opacity: pageNum >= numPages ? 0.35 : 1,
+              cursor: pageNum >= numPages ? "not-allowed" : "pointer",
+            }}
+          >
+            Next ›
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Main PDFViewer ───────────────────────────────────────────────────────────
+function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp }) {
+  // Group results by doc_id
+  const docGroups = useMemo(() => {
+    const map = new Map()
+    for (const r of results) {
+      if (!map.has(r.doc_id)) {
+        map.set(r.doc_id, {
+          doc_id: r.doc_id,
+          filename: r.filename,
+          file_url: r.file_url,
+          results: [],
+        })
+      }
+      map.get(r.doc_id).results.push(r)
+    }
+    return Array.from(map.values())
+  }, [results])
+
+  const [activeDocId, setActiveDocId] = useState(() => docGroups[0]?.doc_id ?? null)
+
+  // Reset to first doc on new search
+  const prevResultsRef = useRef(results)
+  if (prevResultsRef.current !== results) {
+    prevResultsRef.current = results
+    const firstId = docGroups[0]?.doc_id ?? null
+    if (firstId !== activeDocId) setActiveDocId(firstId)
+  }
+
+  // Sync from parent (result card click)
+  useEffect(() => {
+    if (activeDocIdProp && activeDocIdProp !== activeDocId) {
+      setActiveDocId(activeDocIdProp)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeDocIdProp])
+
+  if (!results || results.length === 0) return null
+
+  const activeGroup = docGroups.find((g) => g.doc_id === activeDocId) ?? docGroups[0]
+
+  return (
+    <div style={styles.container}>
+      {/* Document tabs */}
+      {docGroups.length > 1 && (
+        <div style={styles.docTabs}>
+          {docGroups.map((g) => (
+            <button
+              key={g.doc_id}
+              onClick={() => setActiveDocId(g.doc_id)}
+              style={{
+                ...styles.docTab,
+                borderBottom: g.doc_id === activeDocId
+                  ? "2px solid var(--accent)"
+                  : "2px solid transparent",
+                color: g.doc_id === activeDocId
+                  ? "var(--accent)"
+                  : "var(--text-muted)",
+              }}
+              title={g.filename}
+            >
+              <svg width="11" height="11" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ flexShrink: 0 }}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+              </svg>
+              <span style={styles.docTabName}>{g.filename}</span>
+              <span style={styles.docTabCount}>{g.results.length}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Pass the active group's viewer with a stable fileProp */}
+      <ActiveViewer
+        key={activeGroup.doc_id}
+        group={activeGroup}
+        query={query}
+        activePage={activeGroup.doc_id === activeDocId ? activePage : undefined}
+      />
+    </div>
+  )
+}
+
+/**
+ * ActiveViewer — wrapper that builds a STABLE memoized fileProp
+ * so <Document> never sees a new object reference on re-renders.
+ * This is the root cause fix for Prev/Next resetting the page.
+ */
+function ActiveViewer({ group, query, activePage }) {
+  // fileProp is memoized — only changes when the doc_id (URL) actually changes
+  const fileProp = useMemo(() => {
+    const path = group.file_url || `/api/documents/${group.doc_id}/view`
+    let url = path
+    if (import.meta.env.VITE_API_URL) {
+      const base = import.meta.env.VITE_API_URL.replace(/\/api\/?$/, "")
+      url = `${base}${path}`
+    }
+    const token = localStorage.getItem("token")
+    return {
+      url,
+      httpHeaders: token ? { Authorization: `Bearer ${token}` } : {},
+      withCredentials: false,
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [group.doc_id]) // only rebuild when the document itself changes
+
+  return (
+    <SingleDocViewer
+      docResults={group.results}
+      query={query}
+      activePage={activePage}
+      fileProp={fileProp}
+    />
+  )
+}
+
+export default memo(PDFViewer)
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+const styles = {
+  container: {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%",
+    minWidth: 0,
+  },
+  docTabs: {
+    display: "flex",
+    gap: 2,
+    borderBottom: "1px solid var(--border)",
+    marginBottom: 12,
+    overflowX: "auto",
+    flexShrink: 0,
+  },
+  docTab: {
+    display: "flex",
+    alignItems: "center",
+    gap: 5,
+    padding: "8px 12px",
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontSize: 12,
+    fontWeight: 500,
+    whiteSpace: "nowrap",
+    transition: "color 0.15s",
+    maxWidth: 180,
+  },
+  docTabName: {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    maxWidth: 120,
+  },
+  docTabCount: {
+    background: "var(--accent-glow)",
+    color: "var(--accent-hover)",
+    borderRadius: 10,
+    padding: "0 5px",
+    fontSize: 10,
+    fontWeight: 700,
+    flexShrink: 0,
+  },
+  docViewer: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 12,
+    width: "100%",
+    minWidth: 0,
+  },
+  jumpBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    flexWrap: "wrap",
+    alignSelf: "flex-start",
+    padding: "4px 0",
+    width: "100%",
+  },
+  jumpLabel: {
+    fontSize: 11,
+    color: "var(--text-muted)",
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  jumpBtn: {
+    border: "none",
+    borderRadius: 6,
+    padding: "3px 8px",
+    fontSize: 11,
+    cursor: "pointer",
+    fontFamily: "'JetBrains Mono', monospace",
+    fontWeight: 600,
+    transition: "all 0.12s",
+  },
+  pageWrapper: {
+    position: "relative", // CRITICAL for canvas overlay positioning
+    width: "100%",
+    lineHeight: 0,        // prevents gap below rendered canvas
+  },
+  msg: {
+    color: "var(--text-muted)",
+    fontSize: 13,
+    padding: 40,
+  },
+  pagination: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "8px 16px",
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    alignSelf: "center",
+  },
+  pageBtn: {
+    background: "transparent",
+    border: "none",
+    color: "var(--text-secondary)",
+    fontSize: 13,
+    fontFamily: "inherit",
+    padding: "4px 8px",
+    borderRadius: 6,
+    transition: "all 0.12s",
+  },
+  pageInfo: {
+    fontSize: 13,
+    color: "var(--text-muted)",
+    fontFamily: "'JetBrains Mono', monospace",
+    minWidth: 60,
+    textAlign: "center",
+  },
+}
+</file>
+
+<file path="frontend/src/features/search/SearchPage.jsx">
+import { useState, memo, useCallback } from "react"
+import MainLayout from "../../shared/layout/MainLayout"
+import Sidebar from "../documents/Sidebar"
+import PDFViewer from "./PDFViewer"
+import useSearch from "../../hooks/useSearch"
+import { searchDocuments } from "./api"
+import { toast } from "../../shared/utils/toast"
+
+const StablePDFViewer = memo(PDFViewer)
+
+export default function SearchPage() {
+  const { results, setResults, resetSearch } = useSearch()
+  const [query, setQuery] = useState("")
+  const [submittedQuery, setSubmittedQuery] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [searched, setSearched] = useState(false)
+
+  // Track which result the user clicked — drives the PDF viewer
+  const [activePage, setActivePage] = useState(null)
+  const [activeDocId, setActiveDocId] = useState(null)
+  // For mobile: show PDF panel or results panel
+  const [mobileView, setMobileView] = useState("results") // "results" | "pdf"
+
+  const handleSearch = useCallback(async () => {
+    const q = query.trim()
+    if (!q) return
+
+    resetSearch()
+    setLoading(true)
+    setSearched(true)
+    setActivePage(null)
+    setActiveDocId(null)
+    setMobileView("results")
+
+    try {
+      const data = await searchDocuments(q)
+      setResults(data.results)
+      setSubmittedQuery(q)
+      if (data.results.length > 0) {
+        setActiveDocId(data.results[0].doc_id)
+        setActivePage(data.results[0].page_no)
+      }
+    } catch {
+      toast.error("Search failed. Please try again.")
+    } finally {
+      setLoading(false)
+    }
+  }, [query, resetSearch, setResults])
+
+  const handleKeyDown = useCallback(
+    (e) => { if (e.key === "Enter") handleSearch() },
+    [handleSearch]
+  )
+
+  const handleClear = useCallback(() => {
+    setQuery("")
+    setSubmittedQuery("")
+    resetSearch()
+    setSearched(false)
+    setActivePage(null)
+    setActiveDocId(null)
+    setMobileView("results")
+  }, [resetSearch])
+
+  // When user clicks a result card — navigate the PDF viewer
+  const handleResultClick = useCallback((r) => {
+    setActiveDocId(r.doc_id)
+    setActivePage(r.page_no)
+    setMobileView("pdf")
+  }, [])
+
+  return (
+    <MainLayout sidebar={<Sidebar />}>
+      <div style={styles.page}>
+        {/* Search header */}
+        <div style={styles.searchHeader}>
+          <div style={styles.searchRow}>
+            <div style={styles.searchBox}>
+              <svg style={styles.searchIcon} width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607z" />
+              </svg>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={handleKeyDown}
+                style={styles.input}
+                placeholder="Search your documents semantically..."
+                autoFocus
+              />
+              {query && (
+                <button onClick={handleClear} style={styles.clearBtn}>
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              )}
+            </div>
+            <button
+              onClick={handleSearch}
+              disabled={loading || !query.trim()}
+              style={{
+                ...styles.searchBtn,
+                opacity: (loading || !query.trim()) ? 0.6 : 1,
+                cursor: (loading || !query.trim()) ? "not-allowed" : "pointer",
+              }}
+            >
+              {loading ? <span style={styles.spinner} /> : "Search"}
+            </button>
+          </div>
+
+          {searched && !loading && (
+            <div style={styles.metaRow}>
+              <span style={styles.resultsMeta}>
+                {results.length > 0
+                  ? `${results.length} result${results.length !== 1 ? "s" : ""} found`
+                  : "No results found"}
+              </span>
+              {/* Mobile toggle between results list and PDF */}
+              {results.length > 0 && (
+                <div style={styles.mobileToggle}>
+                  <button
+                    onClick={() => setMobileView("results")}
+                    style={{
+                      ...styles.toggleBtn,
+                      background: mobileView === "results" ? "var(--accent)" : "var(--bg-hover)",
+                      color: mobileView === "results" ? "#fff" : "var(--text-secondary)",
+                    }}
+                  >
+                    Results
+                  </button>
+                  <button
+                    onClick={() => setMobileView("pdf")}
+                    style={{
+                      ...styles.toggleBtn,
+                      background: mobileView === "pdf" ? "var(--accent)" : "var(--bg-hover)",
+                      color: mobileView === "pdf" ? "#fff" : "var(--text-secondary)",
+                    }}
+                  >
+                    PDF
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Content */}
+        <div style={styles.content}>
+          {!searched && (
+            <div style={styles.emptyState}>
+              <div style={styles.emptyIcon}>
+                <svg width="40" height="40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={0.8}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607z" />
+                </svg>
+              </div>
+              <p style={styles.emptyTitle}>Semantic Document Search</p>
+              <p style={styles.emptyDesc}>Search across all your uploaded PDFs using natural language. Results are ranked by semantic similarity.</p>
+            </div>
+          )}
+
+          {searched && !loading && results.length === 0 && (
+            <div style={styles.emptyState}>
+              <p style={styles.emptyTitle}>No results found</p>
+              <p style={styles.emptyDesc}>Try different keywords or upload more documents.</p>
+            </div>
+          )}
+
+          {results.length > 0 && (
+            <div style={styles.resultsLayout}>
+              {/* Results list — hidden on mobile when PDF is shown */}
+              <div
+                style={{
+                  ...styles.resultsList,
+                  display: mobileView === "pdf" ? "none" : "flex",
+                }}
+                className="results-list-panel"
+              >
+                {results.map((r, i) => {
+                  const isActive = activeDocId === r.doc_id && activePage === r.page_no
+                  return (
+                    <div
+                      key={i}
+                      style={{
+                        ...styles.resultCard,
+                        ...(isActive ? styles.resultCardActive : {}),
+                      }}
+                      className="fade-in"
+                      onClick={() => handleResultClick(r)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => e.key === "Enter" && handleResultClick(r)}
+                    >
+                      <div style={styles.resultHeader}>
+                        <div style={styles.resultDoc}>
+                          <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+                          </svg>
+                          {r.filename}
+                        </div>
+                        <div style={styles.resultMeta}>
+                          <span style={styles.pageTag}>p.{r.page_no}</span>
+                          <span style={styles.scoreTag}>{(r.score * 100).toFixed(0)}%</span>
+                        </div>
+                      </div>
+                      <p style={styles.resultContent}>
+                        {r.content.slice(0, 200)}{r.content.length > 200 ? "…" : ""}
+                      </p>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* PDF Viewer — hidden on mobile when results list is shown */}
+              <div
+                style={{
+                  ...styles.pdfArea,
+                  display: mobileView === "results" ? "none" : "flex",
+                }}
+                className="pdf-area-panel"
+              >
+                <StablePDFViewer
+                  results={results}
+                  query={submittedQuery}
+                  activePage={activePage}
+                  activeDocId={activeDocId}
+                />
+              </div>
+
+              {/* Desktop: always show both side by side */}
+              <style>{`
+                @media (min-width: 768px) {
+                  .results-list-panel { display: flex !important; }
+                  .pdf-area-panel { display: flex !important; }
+                }
+              `}</style>
+            </div>
+          )}
+        </div>
+      </div>
+    </MainLayout>
+  )
+}
+
+const styles = {
+  page: { display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" },
+  searchHeader: { padding: "16px 16px 12px", borderBottom: "1px solid var(--border)", flexShrink: 0 },
+  searchRow: { display: "flex", gap: 10, alignItems: "center" },
+  searchBox: {
+    flex: 1, display: "flex", alignItems: "center",
+    background: "var(--bg-card)", border: "1px solid var(--border)",
+    borderRadius: 12, padding: "0 14px", gap: 10, transition: "border-color 0.15s",
+    minWidth: 0,
+  },
+  searchIcon: { color: "var(--text-muted)", flexShrink: 0 },
+  input: {
+    flex: 1, background: "transparent", border: "none", outline: "none",
+    fontSize: 14, color: "var(--text-primary)", fontFamily: "inherit", padding: "12px 0",
+    minWidth: 0,
+  },
+  clearBtn: {
+    display: "flex", alignItems: "center", background: "transparent",
+    border: "none", cursor: "pointer", color: "var(--text-muted)", padding: 2, flexShrink: 0,
+  },
+  searchBtn: {
+    display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+    padding: "11px 18px", background: "var(--accent)", border: "none", borderRadius: 12,
+    color: "#fff", fontSize: 13, fontWeight: 600, fontFamily: "inherit",
+    letterSpacing: "0.01em", minWidth: 72, flexShrink: 0,
+  },
+  spinner: {
+    width: 14, height: 14, border: "2px solid rgba(255,255,255,0.3)",
+    borderTopColor: "#fff", borderRadius: "50%", display: "inline-block",
+    animation: "spin 0.8s linear infinite",
+  },
+  metaRow: {
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+    marginTop: 8, flexWrap: "wrap", gap: 8,
+  },
+  resultsMeta: { fontSize: 12, color: "var(--text-muted)", fontFamily: "'JetBrains Mono', monospace" },
+  mobileToggle: { display: "flex", gap: 4 },
+  toggleBtn: {
+    border: "none", borderRadius: 8, padding: "4px 12px",
+    fontSize: 12, fontWeight: 600, fontFamily: "inherit", cursor: "pointer",
+    transition: "all 0.12s",
+  },
+  content: { flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" },
+  emptyState: {
+    display: "flex", flexDirection: "column", alignItems: "center",
+    justifyContent: "center", flex: 1, gap: 10, padding: 40, color: "var(--text-muted)",
+  },
+  emptyIcon: {
+    width: 72, height: 72, background: "var(--bg-card)", borderRadius: 20,
+    display: "flex", alignItems: "center", justifyContent: "center",
+    marginBottom: 4, color: "var(--border-light)",
+  },
+  emptyTitle: { fontSize: 15, fontWeight: 600, color: "var(--text-secondary)", margin: 0 },
+  emptyDesc: { fontSize: 13, color: "var(--text-muted)", textAlign: "center", maxWidth: 400, lineHeight: 1.6, margin: 0 },
+  resultsLayout: { display: "flex", flex: 1, overflow: "hidden", gap: 0 },
+  resultsList: {
+    width: 300, flexShrink: 0, overflowY: "auto",
+    borderRight: "1px solid var(--border)", padding: "12px",
+    flexDirection: "column", gap: 8,
+  },
+  resultCard: {
+    background: "var(--bg-card)", border: "1px solid var(--border)",
+    borderRadius: 12, padding: "12px 14px", cursor: "pointer", transition: "border-color 0.15s",
+  },
+  resultCardActive: {
+    border: "1px solid var(--accent)",
+    background: "var(--accent-glow)",
+  },
+  resultHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8 },
+  resultDoc: {
+    display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 600,
+    color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.04em",
+    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0,
+  },
+  resultMeta: { display: "flex", gap: 4, flexShrink: 0 },
+  pageTag: {
+    padding: "2px 7px", background: "var(--bg-hover)", borderRadius: 6,
+    fontSize: 11, color: "var(--text-muted)", fontFamily: "'JetBrains Mono', monospace",
+  },
+  scoreTag: {
+    padding: "2px 7px", background: "var(--accent-glow)", borderRadius: 6,
+    fontSize: 11, color: "var(--accent-hover)", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+  },
+  resultContent: { fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.6, margin: 0 },
+  pdfArea: {
+    flex: 1, overflow: "auto", padding: "16px", flexDirection: "column",
+    minWidth: 0,
+  },
+}
+</file>
+
+<file path="frontend/src/shared/components/Navbar.jsx">
+import { useNavigate, useLocation, Link } from "react-router-dom"
+import { logoutUser } from "../../features/auth/api"
+import { toast } from "../utils/toast"
+
+export default function Navbar({ onMenuClick, showMenu }) {
+  const navigate = useNavigate()
+  const location = useLocation()
+
+  const handleLogout = () => {
+    logoutUser()
+    toast.info("Signed out")
+    navigate("/login")
+  }
+
+  const isActive = (path) => location.pathname === path
+
+  return (
+    <nav style={styles.nav}>
+      {/* Hamburger — only on mobile when sidebar exists */}
+      {showMenu && (
+        <button onClick={onMenuClick} style={styles.menuBtn} aria-label="Toggle sidebar">
+          <svg width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+          </svg>
+        </button>
+      )}
+
+      {/* Brand */}
+      <div style={styles.brand}>
+        <svg width="22" height="21" viewBox="0 0 48 46" fill="none">
+          <path fill="#7c6af7" d="M25.946 44.938c-.664.845-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.287c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.497 0-3.578-1.842-3.578H1.237c-.92 0-1.456-1.04-.92-1.788L10.013.474c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.579 1.842 3.579h11.377c.943 0 1.473 1.088.89 1.83L25.947 44.94z"/>
+        </svg>
+        <span style={styles.brandText}>DocSearch</span>
+      </div>
+
+      {/* Nav links */}
+      <div style={styles.links}>
+        <Link
+          to="/"
+          style={{
+            ...styles.link,
+            ...(isActive("/") ? styles.linkActive : {}),
+          }}
+        >
+          <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607z" />
+          </svg>
+          <span style={styles.linkText}>Search</span>
+        </Link>
+
+        <Link
+          to="/ai"
+          style={{
+            ...styles.link,
+            ...(isActive("/ai") ? styles.linkActive : {}),
+          }}
+        >
+          <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09Z" />
+          </svg>
+          <span style={styles.linkText}>AI Ask</span>
+        </Link>
+      </div>
+
+      {/* Logout */}
+      <button onClick={handleLogout} style={styles.logoutBtn}>
+        <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V15M12 9l-3 3m0 0 3 3m-3-3h12.75" />
+        </svg>
+        <span style={styles.logoutText}>Sign out</span>
+      </button>
+    </nav>
+  )
+}
+
+const styles = {
+  nav: {
+    height: 56,
+    background: "var(--bg-secondary)",
+    borderBottom: "1px solid var(--border)",
+    display: "flex",
+    alignItems: "center",
+    padding: "0 16px",
+    gap: 8,
+    flexShrink: 0,
+  },
+  menuBtn: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: 36,
+    height: 36,
+    background: "transparent",
+    border: "none",
+    borderRadius: 8,
+    cursor: "pointer",
+    color: "var(--text-secondary)",
+    flexShrink: 0,
+    padding: 0,
+  },
+  brand: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    marginRight: "auto",
+  },
+  brandText: {
+    fontSize: 15,
+    fontWeight: 700,
+    color: "var(--text-primary)",
+    letterSpacing: "-0.02em",
+  },
+  links: {
+    display: "flex",
+    gap: 4,
+  },
+  link: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "6px 10px",
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 500,
+    color: "var(--text-secondary)",
+    textDecoration: "none",
+    transition: "all 0.15s",
+    letterSpacing: "0.01em",
+  },
+  linkText: {
+    // Hidden on very small screens via CSS — link icons still show
+  },
+  linkActive: {
+    background: "var(--accent-glow)",
+    color: "var(--accent-hover)",
+  },
+  logoutBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "6px 10px",
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 500,
+    color: "var(--text-secondary)",
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontFamily: "inherit",
+    transition: "all 0.15s",
+    flexShrink: 0,
+  },
+  logoutText: {},
+}
+</file>
+
+<file path="frontend/src/shared/layout/MainLayout.jsx">
+import { useState, useEffect } from "react"
+import Navbar from "../components/Navbar"
+
+export default function MainLayout({ sidebar, children }) {
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [isMobile, setIsMobile] = useState(false)
+
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 768)
+    check()
+    window.addEventListener("resize", check)
+    return () => window.removeEventListener("resize", check)
+  }, [])
+
+  // Close sidebar when clicking outside on mobile
+  const handleOverlayClick = () => setSidebarOpen(false)
+
+  return (
+    <div style={styles.root}>
+      <Navbar
+        onMenuClick={() => setSidebarOpen((v) => !v)}
+        showMenu={isMobile && !!sidebar}
+      />
+      <div style={styles.body}>
+        {/* Sidebar — on desktop always visible, on mobile slides in as overlay */}
+        {sidebar && (
+          <>
+            {/* Mobile overlay backdrop */}
+            {isMobile && sidebarOpen && (
+              <div
+                style={styles.overlay}
+                onClick={handleOverlayClick}
+              />
+            )}
+            <aside
+              style={{
+                ...styles.sidebar,
+                ...(isMobile ? {
+                  position: "fixed",
+                  top: 56, // navbar height
+                  left: 0,
+                  height: "calc(100vh - 56px)",
+                  zIndex: 200,
+                  transform: sidebarOpen ? "translateX(0)" : "translateX(-100%)",
+                  transition: "transform 0.25s ease",
+                } : {}),
+              }}
+            >
+              {sidebar}
+            </aside>
+          </>
+        )}
+        <main style={styles.main}>{children}</main>
+      </div>
+    </div>
+  )
+}
+
+const styles = {
+  root: {
+    display: "flex",
+    flexDirection: "column",
+    height: "100vh",
+    overflow: "hidden",
+    background: "var(--bg-primary)",
+  },
+  body: {
+    display: "flex",
+    flex: 1,
+    overflow: "hidden",
+    position: "relative",
+  },
+  sidebar: {
+    width: "var(--sidebar-w)",
+    flexShrink: 0,
+    borderRight: "1px solid var(--border)",
+    overflow: "hidden",
+    display: "flex",
+    flexDirection: "column",
+    background: "var(--bg-secondary)",
+  },
+  overlay: {
+    position: "fixed",
+    inset: 0,
+    top: 56,
+    background: "rgba(0,0,0,0.5)",
+    zIndex: 199,
+  },
+  main: {
+    flex: 1,
+    overflow: "auto",
+    display: "flex",
+    flexDirection: "column",
+    minWidth: 0,
+  },
+}
+</file>
+
+<file path="frontend/src/shared/utils/axios.js">
+import axios from "axios"
+
+// With Vite proxy configured, we call /api directly — no env var needed.
+// In production, set VITE_API_URL to your backend domain.
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || "/api",
+})
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("token")
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// Global response error handler — redirect to /login on 401
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem("token")
+      // Only redirect if not already on login page
+      if (!window.location.pathname.includes("/login")) {
+        window.location.href = "/login"
+      }
+    }
+    return Promise.reject(error)
+  }
+)
+
+export default api
+</file>
+
+<file path="frontend/src/index.css">
+/* @import MUST come before @tailwind directives — PostCSS requirement */
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #0f0f13;
+  --bg-secondary: #16161d;
+  --bg-card: #1c1c26;
+  --bg-hover: #22222f;
+  --border: #2a2a38;
+  --border-light: #353548;
+  --accent: #7c6af7;
+  --accent-glow: rgba(124, 106, 247, 0.25);
+  --accent-hover: #9585ff;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+  --text-primary: #e8e8f0;
+  --text-secondary: #8888a8;
+  --text-muted: #55556a;
+  --sidebar-w: 280px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Sora', sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+code, pre, .mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+/* Status badge */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 100px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.status-badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.status-completed { background: rgba(34,197,94,0.12); color: #22c55e; }
+.status-completed::before { background: #22c55e; }
+.status-processing { background: rgba(245,158,11,0.12); color: #f59e0b; animation: pulse-status 1.5s infinite; }
+.status-processing::before { background: #f59e0b; }
+.status-pending { background: rgba(136,136,168,0.12); color: #8888a8; }
+.status-pending::before { background: #8888a8; }
+.status-failed { background: rgba(239,68,68,0.12); color: #ef4444; }
+.status-failed::before { background: #ef4444; }
+
+@keyframes pulse-status {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Shimmer loading */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* Spin animation */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spin { animation: spin 0.8s linear infinite; }
+
+/* Fade in */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.25s ease forwards; }
+
+/* Toast */
+.toast-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  padding: 12px 16px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 500;
+  border: 1px solid;
+  pointer-events: all;
+  animation: fadeIn 0.2s ease;
+  max-width: 320px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.toast-success { background: rgba(34,197,94,0.1); border-color: rgba(34,197,94,0.3); color: #22c55e; }
+.toast-error { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.3); color: #ef4444; }
+.toast-info { background: rgba(124,106,247,0.1); border-color: rgba(124,106,247,0.3); color: #9585ff; }
+
+/* react-pdf overrides */
+.react-pdf__Page { background: transparent !important; }
+.react-pdf__Page canvas { border-radius: 8px; box-shadow: 0 4px 32px rgba(0,0,0,0.5); max-width: 100%; }
+
+/* ── Mobile responsive ────────────────────────────────────────────────────── */
+
+/* On mobile: hide sidebar by default (MainLayout handles show/hide via transform) */
+@media (max-width: 767px) {
+  :root {
+    --sidebar-w: 260px;
+  }
+
+  /* Results list takes full width on mobile */
+  .results-list-panel {
+    width: 100% !important;
+    border-right: none !important;
+  }
+
+  /* PDF area takes full width on mobile */
+  .pdf-area-panel {
+    width: 100% !important;
+    padding: 8px !important;
+  }
+
+  /* Hide "Sign out" text on very small screens, keep icon */
+  .logout-text { display: none; }
+
+  /* Shrink nav link labels on mobile */
+  .nav-link-text { display: none; }
+
+  /* Toast smaller on mobile */
+  .toast-container {
+    bottom: 12px;
+    right: 12px;
+    left: 12px;
+  }
+  .toast {
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 400px) {
+  /* Very small phones */
+  :root {
+    --sidebar-w: 85vw;
+  }
+}
+</file>
+
+<file path="frontend/src/main.jsx">
+import { StrictMode } from "react"
+import { createRoot } from "react-dom/client"
+import "react-pdf/dist/Page/AnnotationLayer.css"
+import "react-pdf/dist/Page/TextLayer.css"
+import "./index.css"
+
+import AppRoutes from "./app/routes"
+
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
+    <AppRoutes />
+  </StrictMode>
+)
+</file>
+
+<file path="frontend/index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DocSearch — Semantic Document Intelligence</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+</file>
+
+<file path="frontend/vite.config.js">
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  optimizeDeps: {
+    // Ensure pdfjs-dist is pre-bundled so the worker URL resolves correctly
+    include: ["pdfjs-dist"],
+  },
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        secure: false,
+        // Do NOT rewrite — backend routes already include /api prefix
+        // e.g. /api/documents/... → http://localhost:8000/api/documents/...
+      },
+    },
+  },
+})
+</file>
+
+<file path="backend/main.py">
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from db.postgres import Base, engine
+import db.models  # ensures all models are registered before create_all
+from api.routes_upload import router as upload_router
+from api.routes_search import router as search_router
+from api.routes_rag import router as rag_router
+from api.routes_auth import router as auth_router
+from api.routes_documents import router as documents_router
+from vector_store.qdrant_client import ensure_collection
+from core.config import settings
+import logging
+from fastapi.middleware.cors import CORSMiddleware
+
+logging.basicConfig(level=logging.INFO)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Validate all required env vars at startup — fail fast with clear message
+    settings.validate()
+
+    print("Creating Postgres tables...")
+    Base.metadata.create_all(bind=engine)
+    print("Tables ready")
+
+    print("Ensuring Qdrant collection...")
+    ensure_collection()
+    print("Qdrant ready")
+
+    yield
+
+    print("Shutting down...")
+
+
+app = FastAPI(
+    title="Document Semantic Search Engine",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Allow all localhost/127.0.0.1 origins across any port (Vite can be 5173,
+# 5174, 3000, etc.). In production, replace with your real domain.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+app.include_router(upload_router)
+app.include_router(search_router)
+app.include_router(rag_router)
+app.include_router(auth_router)
+app.include_router(documents_router)
+
+
+@app.get("/")
+def root():
+    return {"message": "Document Search Engine running", "docs": "/docs"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+</file>
+
+</files>

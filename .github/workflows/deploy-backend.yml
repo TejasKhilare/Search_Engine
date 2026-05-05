@@ -1,0 +1,61 @@
+# .github/workflows/deploy-backend.yml
+
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'docker/**'
+      - '.github/workflows/deploy-backend.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "==> Pulling latest code"
+            cd ~/app
+            git pull origin main
+
+            echo "==> Writing .env file"
+            cat > backend/.env << 'ENVEOF'
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            QDRANT_HOST=localhost
+            QDRANT_PORT=6333
+            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+            OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+            SECRET_KEY=${{ secrets.SECRET_KEY }}
+            ALGORITHM=HS256
+            ACCESS_TOKEN_EXPIRE_MINUTES=60
+            EMBEDDING_DIM=3072
+            QDRANT_COLLECTION=document_chunks
+            S3_BUCKET_NAME=${{ secrets.S3_BUCKET_NAME }}
+            AWS_REGION=${{ secrets.AWS_REGION }}
+            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            ENVEOF
+
+            echo "==> Rebuilding and restarting containers"
+            cd docker
+            docker compose down
+            docker compose build --no-cache api
+            docker compose up -d
+
+            echo "==> Waiting for health check"
+            sleep 8
+            curl -f http://localhost:8000/health || (docker compose logs api && exit 1)
+
+            echo "==> Deploy complete"

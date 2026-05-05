@@ -15,6 +15,11 @@ from vector_store.qdrant_client import search_vectors
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["search"])
 
+# Minimum similarity score — results below this are irrelevant and discarded
+MIN_SCORE = 0.50
+# Maximum number of results shown to the user
+MAX_RESULTS = 5
+
 
 # ---------------------------
 # RESPONSE MODELS
@@ -44,7 +49,7 @@ class SearchResponse(BaseModel):
 def search_documents(
     q: str = Query(..., min_length=1),
     doc_id: Optional[str] = Query(None),
-    top_k: int = Query(10, ge=1, le=50),
+    top_k: int = Query(20, ge=1, le=50),   # fetch more from Qdrant so we have room to filter
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -71,7 +76,7 @@ def search_documents(
         logger.error(f"Embedding failed: {e}")
         raise HTTPException(status_code=500, detail="Embedding failed")
 
-    # Step 3: Search vectors
+    # Step 3: Search vectors — fetch top_k so we have enough after score filtering
     try:
         hits = search_vectors(
             query_vector=query_vector,
@@ -82,10 +87,12 @@ def search_documents(
         logger.error(f"Vector search failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
-    # Step 4: Filter hits by user access
+    # Step 4: Filter hits by user access AND minimum relevance score
     filtered_hits = [
         hit for hit in hits
-        if hit.payload and str(hit.payload.get("doc_id")) in allowed_doc_ids
+        if hit.payload
+        and str(hit.payload.get("doc_id")) in allowed_doc_ids
+        and float(hit.score) >= MIN_SCORE
     ]
 
     # Step 5: Build doc_map (NO extra DB query)
@@ -94,12 +101,11 @@ def search_documents(
         for doc in user_docs
     }
 
-    #Step 6: Build results
+    # Step 6: Build results, capped at MAX_RESULTS
     results: List[SearchResult] = []
 
-    for hit in filtered_hits:
+    for hit in filtered_hits[:MAX_RESULTS]:
         payload = hit.payload or {}
-
         hit_doc_id = str(payload.get("doc_id", ""))
 
         results.append(SearchResult(
@@ -114,7 +120,7 @@ def search_documents(
             end_pos=int(payload.get("end_pos", 0)),
         ))
 
-    #Step 7: Log search
+    # Step 7: Log search
     try:
         db.add(SearchLog(
             query=q,
