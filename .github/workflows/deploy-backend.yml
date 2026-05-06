@@ -1,5 +1,3 @@
-# .github/workflows/deploy-backend.yml
-
 name: Deploy Backend to EC2
 
 on:
@@ -20,10 +18,19 @@ jobs:
 
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DATABASE_URL,GEMINI_API_KEY,OPENROUTER_API_KEY,SECRET_KEY,S3_BUCKET_NAME,AWS_REGION,FRONTEND_URL
           script: |
             set -e
 
@@ -32,30 +39,30 @@ jobs:
             git pull origin main
 
             echo "==> Writing .env file"
-            cat > backend/.env << 'ENVEOF'
-            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            cat > backend/.env << ENVEOF
+            DATABASE_URL=$DATABASE_URL
             QDRANT_HOST=qdrant
             QDRANT_PORT=6333
-            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
-            OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
-            SECRET_KEY=${{ secrets.SECRET_KEY }}
+            GEMINI_API_KEY=$GEMINI_API_KEY
+            OPENROUTER_API_KEY=$OPENROUTER_API_KEY
+            SECRET_KEY=$SECRET_KEY
             ALGORITHM=HS256
             ACCESS_TOKEN_EXPIRE_MINUTES=60
             EMBEDDING_DIM=3072
             QDRANT_COLLECTION=document_chunks
-            S3_BUCKET_NAME=${{ secrets.S3_BUCKET_NAME }}
-            AWS_REGION=${{ secrets.AWS_REGION }}
-            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            S3_BUCKET_NAME=$S3_BUCKET_NAME
+            AWS_REGION=$AWS_REGION
+            FRONTEND_URL=$FRONTEND_URL
             ENVEOF
 
             echo "==> Rebuilding and restarting containers"
             cd docker
-            docker compose down
-            docker compose build --no-cache api
-            docker compose up -d
+            docker-compose down
+            docker-compose build --no-cache api
+            docker-compose up -d
 
             echo "==> Waiting for health check"
             sleep 8
-            curl -f http://localhost:8000/health || (docker compose logs api && exit 1)
+            curl -f http://localhost:8000/ || (docker-compose logs api && exit 1)
 
             echo "==> Deploy complete"
