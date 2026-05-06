@@ -36,24 +36,20 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
   const [numPages, setNumPages] = useState(null)
   const [pageNum, setPageNum] = useState(docResults[0]?.page_no || 1)
   const [pageReady, setPageReady] = useState(false)
-  // Actual rendered canvas size — passed to HighlightLayer for coordinate mapping
   const [renderedSize, setRenderedSize] = useState(null)
   const loadedUrlRef = useRef(null)
 
   const first = docResults[0]
 
-  // Sync to activePage prop when parent drives navigation via result card click
   useEffect(() => {
     if (activePage && activePage !== pageNum) {
       setPageReady(false)
       setRenderedSize(null)
       setPageNum(activePage)
     }
-    // intentionally only re-run when activePage changes
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePage])
 
-  // Pages that have search results for this doc
   const resultPages = useMemo(
     () => [...new Set(docResults.map((r) => r.page_no))].sort((a, b) => a - b),
     [docResults]
@@ -72,11 +68,8 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
     [fileProp.url, first.page_no]
   )
 
-  // After react-pdf renders the page, measure the actual canvas element
-  // so HighlightLayer knows the exact pixel dimensions for coordinate mapping
   const handleRenderSuccess = useCallback(() => {
     setPageReady(true)
-    // Find the canvas react-pdf rendered and read its displayed size
     if (pageWrapperRef.current) {
       const canvas = pageWrapperRef.current.querySelector("canvas")
       if (canvas) {
@@ -104,7 +97,6 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
   return (
     <div style={styles.docViewer} ref={containerRef}>
 
-      {/* Result page jump buttons */}
       {resultPages.length > 0 && (
         <div style={styles.jumpBar}>
           <span style={styles.jumpLabel}>Results on pages:</span>
@@ -124,7 +116,6 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
         </div>
       )}
 
-      {/* PDF Document */}
       <Document
         file={fileProp}
         onLoadSuccess={handleLoadSuccess}
@@ -132,7 +123,6 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
         loading={<div style={styles.msg}>Loading PDF…</div>}
         error={<div style={styles.msg}>Failed to load PDF.</div>}
       >
-        {/* pageWrapper is position:relative so canvas overlay is positioned correctly */}
         <div style={styles.pageWrapper} ref={pageWrapperRef}>
           <Page
             pageNumber={pageNum}
@@ -142,7 +132,6 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
             onRenderSuccess={handleRenderSuccess}
             loading={<div style={styles.msg}>Rendering page…</div>}
           />
-          {/* Canvas highlight overlay — shown once page is rendered and size is measured */}
           {pageReady && renderedSize && (
             <HighlightLayer
               fileProp={fileProp}
@@ -154,7 +143,6 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
         </div>
       </Document>
 
-      {/* Pagination — show once PDF is loaded */}
       {numPages != null && (
         <div style={styles.pagination}>
           <button
@@ -189,8 +177,8 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
 }
 
 // ─── Main PDFViewer — groups results by doc, handles multi-doc tabs ───────────
+// ✅ ONLY CHANGE: fetch presigned URL as JSON first to avoid S3 CORS redirect
 function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp }) {
-  // Group results by doc_id, preserving first-appearance order
   const docGroups = useMemo(() => {
     const map = new Map()
     for (const r of results) {
@@ -204,12 +192,18 @@ function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp })
 
   const [activeDocId, setActiveDocId] = useState(() => docGroups[0]?.doc_id ?? null)
 
+  // ✅ NEW: state for fetched presigned URL
+  const [pdfUrl, setPdfUrl] = useState(null)
+
   // Reset to first doc whenever results change (new search)
   const prevResultsRef = useRef(results)
   if (prevResultsRef.current !== results) {
     prevResultsRef.current = results
     const firstId = docGroups[0]?.doc_id ?? null
-    if (firstId !== activeDocId) setActiveDocId(firstId)
+    if (firstId !== activeDocId) {
+      setActiveDocId(firstId)
+      setPdfUrl(null)
+    }
   }
 
   // Sync when parent drives activeDocId via result card click
@@ -220,29 +214,29 @@ function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeDocIdProp])
 
+  // ✅ NEW: fetch presigned URL whenever active doc changes
+  useEffect(() => {
+    if (!activeDocId) return
+    setPdfUrl(null)
+    const token = localStorage.getItem("token")
+    const base = import.meta.env.VITE_API_URL || ""
+    fetch(`${base}/api/documents/${activeDocId}/view`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => res.json())
+      .then((data) => setPdfUrl(data.url))
+      .catch((err) => console.error("PDF URL fetch failed:", err))
+  }, [activeDocId])
+
   if (!results || results.length === 0) return null
 
   const activeGroup = docGroups.find((g) => g.doc_id === activeDocId) ?? docGroups[0]
 
-  // Build fileProp once per active document — includes auth token
-  const token = localStorage.getItem("token")
-  const fileUrl = (() => {
-    const path = activeGroup.file_url || `/api/documents/${activeGroup.doc_id}/view`
-    if (import.meta.env.VITE_API_URL) {
-      const base = import.meta.env.VITE_API_URL.replace(/\/api\/?$/, "")
-      return `${base}${path}`
-    }
-    return path
-  })()
-  const fileProp = {
-    url: fileUrl,
-    httpHeaders: token ? { Authorization: `Bearer ${token}` } : {},
-    withCredentials: false,
-  }
+  // ✅ CHANGED: use fetched presigned URL directly — no auth headers needed
+  const fileProp = pdfUrl ? { url: pdfUrl } : null
 
   return (
     <div style={styles.container}>
-      {/* Document tabs — only when more than one doc returned */}
       {docGroups.length > 1 && (
         <div style={styles.docTabs}>
           {docGroups.map((g) => (
@@ -270,21 +264,23 @@ function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp })
         </div>
       )}
 
-      {/* Single doc viewer — key forces remount on doc change */}
-      <SingleDocViewer
-        key={activeGroup.doc_id}
-        docResults={activeGroup.results}
-        query={query}
-        activePage={activeGroup.doc_id === activeDocId ? activePage : undefined}
-        fileProp={fileProp}
-      />
+      {/* ✅ CHANGED: only render when fileProp is ready */}
+      {fileProp && (
+        <SingleDocViewer
+          key={activeGroup.doc_id}
+          docResults={activeGroup.results}
+          query={query}
+          activePage={activeGroup.doc_id === activeDocId ? activePage : undefined}
+          fileProp={fileProp}
+        />
+      )}
     </div>
   )
 }
 
 export default memo(PDFViewer)
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
+// ─── Styles — UNCHANGED ───────────────────────────────────────────────────────
 const styles = {
   container: {
     display: "flex",
@@ -363,9 +359,9 @@ const styles = {
     transition: "all 0.12s",
   },
   pageWrapper: {
-    position: "relative",  // CRITICAL: canvas overlay uses position:absolute relative to this
+    position: "relative",
     width: "100%",
-    lineHeight: 0,         // prevents extra space below canvas
+    lineHeight: 0,
   },
   msg: {
     color: "var(--text-muted)",

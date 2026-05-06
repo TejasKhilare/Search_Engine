@@ -1,6 +1,5 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from db.postgres import get_db
@@ -48,16 +47,13 @@ def view_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    s3_key = str(doc.path)
-
-    # Generate a presigned URL and redirect the browser to it
     url = generate_presigned_url(
-        s3_key=s3_key,
+        s3_key=str(doc.path),
         bucket=settings.S3_BUCKET_NAME,
         region=settings.AWS_REGION,
         expires=3600,
     )
-    return RedirectResponse(url=url)
+    return {"url": url}
 
 
 @router.delete("/documents/{doc_id}")
