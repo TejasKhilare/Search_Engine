@@ -5,9 +5,6 @@ name: Deploy Frontend to S3
 on:
   push:
     branches: [main]
-    paths:
-      - 'frontend/**'
-      - '.github/workflows/deploy-frontend.yml'
 
 jobs:
   deploy:
