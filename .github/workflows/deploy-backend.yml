@@ -34,7 +34,7 @@ jobs:
             echo "==> Writing .env file"
             cat > backend/.env << 'ENVEOF'
             DATABASE_URL=${{ secrets.DATABASE_URL }}
-            QDRANT_HOST=localhost
+            QDRANT_HOST=qdrant
             QDRANT_PORT=6333
             GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
             OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}

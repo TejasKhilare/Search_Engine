@@ -40,6 +40,10 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
+.github/
+  workflows/
+    deploy-backend.yml
+    deploy-frontend.yml
 backend/
   api/
     __init__.py
@@ -77,6 +81,7 @@ backend/
 docker/
   docker-compose.yml
   Dockerfile
+  nginx.conf
 frontend/
   public/
     favicon.svg
@@ -127,8 +132,10 @@ frontend/
     index.css
     main.jsx
   .gitignore
+  Dockerfile
   eslint.config.js
   index.html
+  nginx.conf
   package.json
   postcss.config.js
   README.md
@@ -140,6 +147,129 @@ README.md
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path=".github/workflows/deploy-backend.yml">
+# .github/workflows/deploy-backend.yml
+
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'docker/**'
+      - '.github/workflows/deploy-backend.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "==> Pulling latest code"
+            cd ~/app
+            git pull origin main
+
+            echo "==> Writing .env file"
+            cat > backend/.env << 'ENVEOF'
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            QDRANT_HOST=localhost
+            QDRANT_PORT=6333
+            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+            OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+            SECRET_KEY=${{ secrets.SECRET_KEY }}
+            ALGORITHM=HS256
+            ACCESS_TOKEN_EXPIRE_MINUTES=60
+            EMBEDDING_DIM=3072
+            QDRANT_COLLECTION=document_chunks
+            S3_BUCKET_NAME=${{ secrets.S3_BUCKET_NAME }}
+            AWS_REGION=${{ secrets.AWS_REGION }}
+            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            ENVEOF
+
+            echo "==> Rebuilding and restarting containers"
+            cd docker
+            docker compose down
+            docker compose build --no-cache api
+            docker compose up -d
+
+            echo "==> Waiting for health check"
+            sleep 8
+            curl -f http://localhost:8000/health || (docker compose logs api && exit 1)
+
+            echo "==> Deploy complete"
+</file>
+
+<file path=".github/workflows/deploy-frontend.yml">
+# .github/workflows/deploy-frontend.yml
+
+name: Deploy Frontend to S3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync to S3
+        run: |
+          aws s3 sync frontend/dist/ s3://${{ secrets.S3_BUCKET_NAME_FRONTEND }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html"
+
+          # index.html must never be cached — browsers need the fresh entry point
+          aws s3 cp frontend/dist/index.html s3://${{ secrets.S3_BUCKET_NAME_FRONTEND }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Done
+        run: echo "Frontend deployed to S3 ✓"
+</file>
 
 <file path="backend/api/__init__.py">
 
@@ -896,99 +1026,8 @@ def generate_answer(query: str, contexts: List[str]) -> str:
 
 </file>
 
-<file path="backend/utils/file_utils.py">
-import os
-import uuid
-
-ALLOWED_TYPES = ["pdf"]  # focusing on PDF for now; add png/jpg when OCR is needed
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-
-
-def validate_file(filename: str, size: int) -> str:
-    if not filename or "." not in filename:
-        raise ValueError("Invalid filename")
-
-    ext = filename.rsplit(".", 1)[-1].lower()
-
-    if ext not in ALLOWED_TYPES:
-        raise ValueError(f"Unsupported file type: .{ext}. Allowed: {ALLOWED_TYPES}")
-
-    if size > MAX_FILE_SIZE:
-        raise ValueError(f"File size {size} exceeds 10MB limit")
-
-    return ext
-
-
-def generate_doc_id() -> str:
-    return str(uuid.uuid4())
-
-
-def get_file_path(doc_id: str, ext: str) -> str:
-    storage_dir = "storage"
-    os.makedirs(storage_dir, exist_ok=True)
-    return os.path.join(storage_dir, f"{doc_id}.{ext}")
-</file>
-
 <file path="backend/vector_store/__init__.py">
 
-</file>
-
-<file path="docker/docker-compose.yml">
-services:
-
-  api:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: fastapi_app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
-    volumes:
-      - ../backend:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_started
-    dns:
-    - 8.8.8.8
-    - 8.8.4.4
-    env_file:
-      - ../backend/.env
-    restart: always
-
-  postgres:
-    image: postgres:15
-    container_name: postgres_db
-    restart: always
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
-      POSTGRES_DB: docdb
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d docdb"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  qdrant:
-    image: qdrant/qdrant
-    container_name: qdrant_db
-    restart: always
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
-
-volumes:
-  postgres_data:
-  qdrant_data:
 </file>
 
 <file path="docker/Dockerfile">
@@ -1009,6 +1048,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+</file>
+
+<file path="docker/nginx.conf">
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 15M;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 120s;
+    }
+}
 </file>
 
 <file path="frontend/public/favicon.svg">
@@ -1111,199 +1168,6 @@ export const searchDocuments = async (query) => {
     params: { q: query }
   })
   return res.data
-}
-</file>
-
-<file path="frontend/src/features/search/HighlightLayer.jsx">
-import { useEffect, useRef } from "react"
-import { pdfjs } from "react-pdf"
-
-/**
- * HighlightLayer — canvas-based highlight overlay.
- *
- * Strategy:
- *  1. Always attempt pdfjs page.getTextContent() for coordinate-based highlights.
- *     This works for text-embedded PDFs perfectly.
- *
- *  2. For image/scanned PDFs pdfjs returns 0 text items (no embedded text layer).
- *     In that case we fall back to checking if the OCR `chunkText` (from search
- *     results, already extracted by pytesseract on the backend) contains the keyword.
- *     If yes, we draw a soft highlight banner across the top of the page so the
- *     user knows this page is a match.
- *
- * Props:
- *   fileProp    — stable { url, httpHeaders } object (memoized in PDFViewer)
- *   pageNum     — 1-based page number currently shown
- *   query       — raw search query string
- *   renderedSize — { width, height } of the rendered PDF canvas in CSS px
- *   chunkText   — OCR/extracted text for this page from search results (fallback)
- */
-export default function HighlightLayer({ fileProp, pageNum, query, renderedSize, chunkText }) {
-  const canvasRef = useRef(null)
-
-  useEffect(() => {
-    if (!query || !fileProp?.url || !renderedSize?.width || !renderedSize?.height) return
-
-    // ── Build keyword set from query only ─────────────────────────────────────
-    const stopWords = new Set([
-      "the","a","an","is","are","was","were","be","been","being",
-      "have","has","had","do","does","did","will","would","could",
-      "should","may","might","shall","can","need","dare","ought",
-      "used","to","of","in","on","at","by","for","with","about",
-      "as","into","through","during","before","after","above","below",
-      "from","up","down","out","off","over","under","again","and",
-      "but","or","nor","so","yet","both","either","neither","not",
-      "no","its","it","this","that","these","those","i","you","he",
-      "she","we","they","what","which","who","whom","how","all",
-      "each","few","more","most","other","some","such","than","too",
-      "very","just","also",
-    ])
-
-    const keywords = query
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length > 1 && !stopWords.has(w))
-
-    if (keywords.length === 0) return
-
-    let cancelled = false
-
-    const drawOnCanvas = (drawFn) => {
-      const canvas = canvasRef.current
-      if (!canvas || cancelled) return
-      canvas.width = renderedSize.width
-      canvas.height = renderedSize.height
-      const ctx = canvas.getContext("2d")
-      ctx.clearRect(0, 0, canvas.width, canvas.height)
-      drawFn(ctx, canvas.width, canvas.height)
-    }
-
-    const run = async () => {
-      try {
-        // ── Load PDF via pdfjs (browser caches — no re-download) ──────────────
-        const loadingTask = pdfjs.getDocument({
-          url: fileProp.url,
-          httpHeaders: fileProp.httpHeaders || {},
-          withCredentials: false,
-        })
-
-        const pdfDoc = await loadingTask.promise
-        if (cancelled) return
-
-        const page = await pdfDoc.getPage(pageNum)
-        if (cancelled) return
-
-        const naturalViewport = page.getViewport({ scale: 1 })
-        const scaleX = renderedSize.width / naturalViewport.width
-        const scaleY = renderedSize.height / naturalViewport.height
-
-        const textContent = await page.getTextContent()
-        if (cancelled) return
-
-        // ── Check if this page has any embedded text items ────────────────────
-        const hasEmbeddedText = textContent.items.some(
-          (item) => item.str && item.str.trim().length > 0
-        )
-
-        if (hasEmbeddedText) {
-          // ── STRATEGY 1: coordinate-based highlights (text PDFs) ───────────
-          drawOnCanvas((ctx) => {
-            ctx.fillStyle = "rgba(251, 191, 36, 0.50)"
-
-            for (const item of textContent.items) {
-              const str = item.str
-              if (!str || !str.trim()) continue
-
-              const itemClean = str.toLowerCase().replace(/[^a-z0-9\s]/g, " ")
-              const itemWords = itemClean.split(/\s+/).filter(Boolean)
-              const matched = keywords.some((kw) =>
-                itemWords.some((w) => w === kw)
-              )
-              if (!matched) continue
-
-              // transform = [a, b, c, d, tx, ty]
-              // tx,ty = bottom-left origin in PDF coords (Y-axis up)
-              const [, , , fontSizePdf, tx, ty] = item.transform
-
-              const itemW = item.width > 0
-                ? item.width
-                : Math.abs(fontSizePdf) * str.length * 0.55
-              const itemH = item.height > 0
-                ? item.height
-                : Math.abs(fontSizePdf)
-
-              // Flip Y: PDF Y=0 is bottom, canvas Y=0 is top
-              const cx = tx * scaleX
-              const cy = renderedSize.height - (ty * scaleY) - (itemH * scaleY)
-              const cw = itemW * scaleX
-              const ch = itemH * scaleY
-
-              const pad = 1
-              ctx.fillRect(cx - pad, cy - pad, cw + pad * 2, ch + pad * 2)
-            }
-          })
-        } else {
-          // ── STRATEGY 2: image/scanned page — use OCR chunkText fallback ───
-          // Check if the OCR text for this page (from search results) contains
-          // any of the search keywords.
-          const ocrText = (chunkText || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ")
-          const ocrWords = new Set(ocrText.split(/\s+/).filter(Boolean))
-          const ocrMatch = keywords.some((kw) => ocrWords.has(kw))
-
-          if (ocrMatch) {
-            // Draw a labelled banner at the top of the page so user knows
-            // the keyword was found by OCR on this scanned page
-            drawOnCanvas((ctx, w) => {
-              // Semi-transparent amber banner
-              ctx.fillStyle = "rgba(251, 191, 36, 0.20)"
-              ctx.fillRect(0, 0, w, 36)
-
-              // Left accent bar
-              ctx.fillStyle = "rgba(251, 191, 36, 0.85)"
-              ctx.fillRect(0, 0, 4, 36)
-
-              // Label text
-              ctx.fillStyle = "rgba(120, 80, 0, 0.9)"
-              ctx.font = "bold 12px 'Sora', sans-serif"
-              ctx.fillText(`Keyword found via OCR: "${keywords.join(", ")}"`, 12, 23)
-            })
-          }
-        }
-      } catch (err) {
-        if (!cancelled) console.warn("HighlightLayer error:", err)
-      }
-    }
-
-    run()
-
-    return () => {
-      cancelled = true
-      const canvas = canvasRef.current
-      if (canvas) {
-        const ctx = canvas.getContext("2d")
-        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
-      }
-    }
-  // fileProp is memoized in PDFViewer so this won't fire on every render
-  }, [fileProp, pageNum, query, renderedSize, chunkText])
-
-  return (
-    <canvas
-      ref={canvasRef}
-      style={{
-        position: "absolute",
-        top: 0,
-        left: 0,
-        width: "100%",
-        height: "100%",
-        pointerEvents: "none",
-        borderRadius: 8,
-        mixBlendMode: "multiply",
-      }}
-      aria-hidden="true"
-    />
-  )
 }
 </file>
 
@@ -1499,6 +1363,40 @@ dist-ssr
 *.sw?
 </file>
 
+<file path="frontend/Dockerfile">
+# frontend/Dockerfile
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+COPY . .
+
+# VITE_API_URL is injected at build time via GitHub Actions secret/variable
+# e.g. http://ec2-xx-xx-xx-xx.ap-south-1.compute.amazonaws.com
+ARG VITE_API_URL
+ENV VITE_API_URL=$VITE_API_URL
+
+RUN npm run build
+
+# ── Stage 2: Serve ────────────────────────────────────────────────────────────
+FROM nginx:alpine
+
+# Copy built files
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Nginx config to handle React Router (all routes → index.html)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
+</file>
+
 <file path="frontend/eslint.config.js">
 import js from '@eslint/js'
 import globals from 'globals'
@@ -1521,6 +1419,32 @@ export default defineConfig([
     },
   },
 ])
+</file>
+
+<file path="frontend/nginx.conf">
+# frontend/nginx.conf
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Handle React Router — all unknown paths serve index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Cache static assets aggressively
+    location ~* \.(js|css|png|svg|ico|woff2?)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+}
 </file>
 
 <file path="frontend/package.json">
@@ -1700,378 +1624,6 @@ A full-stack AI application that enables users to upload documents, perform sema
 ---
 </file>
 
-<file path="backend/api/routes_documents.py">
-import os
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-
-from db.postgres import get_db
-from db.models import Document, Chunk ,User
-from core.deps import get_current_user
-from vector_store.qdrant_client import delete_document_vectors
-
-router = APIRouter(prefix="/api", tags=["documents"])
-
-@router.get("/documents")
-def list_documents(
-    user:User=Depends(get_current_user),
-    db: Session = Depends(get_db)):
-    docs = db.query(Document).filter(
-        Document.user_id==user.id).order_by(
-            Document.created_at.desc()).all()
-
-    return [
-        {
-            "doc_id": str(doc.doc_id),
-            "filename": str(doc.filename),
-            "status": str(doc.status),
-            "total_chunks": getattr(doc, "total_chunks", 0),
-            "created_at": doc.created_at,
-        }
-        for doc in docs
-    ]
-
-@router.get("/documents/{doc_id}/view")
-def view_document(
-    doc_id: str,
-    db: Session = Depends(get_db),
-    user:User=Depends(get_current_user)):
-    doc = db.query(Document).filter(
-        Document.doc_id == doc_id,
-        Document.user_id==user.id).first()
-
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    file_path = str(doc.path)
-
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File missing on server")
-
-    return FileResponse(
-        path=file_path,
-        filename=str(doc.filename),
-        media_type="application/pdf"
-    )
-
-@router.delete("/documents/{doc_id}")
-def delete_document(
-    doc_id: str,
-    db: Session = Depends(get_db),
-    user:User=Depends(get_current_user)):
-    doc = db.query(Document).filter(Document.doc_id == doc_id,Document.user_id == user.id).first()
-
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    try:
-        db.query(Chunk).filter(Chunk.doc_id == doc_id).delete()
-        delete_document_vectors(doc_id)
-
-        file_path = str(doc.path)
-        db.delete(doc)
-        db.commit()
-
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-        return {
-            "message": "Document deleted successfully",
-            "doc_id": doc_id,
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-</file>
-
-<file path="backend/api/routes_search.py">
-import logging
-from typing import Optional, List, Dict
-
-from fastapi import APIRouter, HTTPException, Depends, Query
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-
-from db.postgres import get_db
-from db.models import SearchLog, Document, User
-from core.deps import get_current_user
-
-from services.embedding import embed_query
-from vector_store.qdrant_client import search_vectors
-
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["search"])
-
-# Minimum similarity score — results below this are irrelevant and discarded
-MIN_SCORE = 0.50
-# Maximum number of results shown to the user
-MAX_RESULTS = 5
-
-
-# ---------------------------
-# RESPONSE MODELS
-# ---------------------------
-class SearchResult(BaseModel):
-    doc_id: str
-    filename: str
-    file_url: str
-    page_no: int
-    chunk_id: int
-    content: str
-    score: float
-    start_pos: int
-    end_pos: int
-
-
-class SearchResponse(BaseModel):
-    query: str
-    results: List[SearchResult]
-    total: int
-
-
-# ---------------------------
-# SEARCH API
-# ---------------------------
-@router.get("/search", response_model=SearchResponse)
-def search_documents(
-    q: str = Query(..., min_length=1),
-    doc_id: Optional[str] = Query(None),
-    top_k: int = Query(20, ge=1, le=50),   # fetch more from Qdrant so we have room to filter
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    if not q.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
-
-    # Step 1: Get user's documents
-    user_docs = db.query(Document).filter(
-        Document.user_id == user.id
-    ).all()
-
-    allowed_doc_ids = {str(doc.doc_id) for doc in user_docs}
-
-    # Optional: filter by specific doc_id
-    if doc_id:
-        if doc_id not in allowed_doc_ids:
-            raise HTTPException(status_code=403, detail="Access denied")
-        allowed_doc_ids = {doc_id}
-
-    # Step 2: Embed query
-    try:
-        query_vector = embed_query(q)
-    except Exception as e:
-        logger.error(f"Embedding failed: {e}")
-        raise HTTPException(status_code=500, detail="Embedding failed")
-
-    # Step 3: Search vectors — fetch top_k so we have enough after score filtering
-    try:
-        hits = search_vectors(
-            query_vector=query_vector,
-            doc_id=None,
-            top_k=top_k
-        )
-    except Exception as e:
-        logger.error(f"Vector search failed: {e}")
-        raise HTTPException(status_code=500, detail="Search failed")
-
-    # Step 4: Filter hits by user access AND minimum relevance score
-    filtered_hits = [
-        hit for hit in hits
-        if hit.payload
-        and str(hit.payload.get("doc_id")) in allowed_doc_ids
-        and float(hit.score) >= MIN_SCORE
-    ]
-
-    # Step 5: Build doc_map (NO extra DB query)
-    doc_map: Dict[str, str] = {
-        str(doc.doc_id): str(doc.filename)
-        for doc in user_docs
-    }
-
-    # Step 6: Build results, capped at MAX_RESULTS
-    results: List[SearchResult] = []
-
-    for hit in filtered_hits[:MAX_RESULTS]:
-        payload = hit.payload or {}
-        hit_doc_id = str(payload.get("doc_id", ""))
-
-        results.append(SearchResult(
-            doc_id=hit_doc_id,
-            filename=doc_map.get(hit_doc_id, "unknown"),
-            file_url=f"/api/documents/{hit_doc_id}/view",
-            page_no=int(payload.get("page_no", 0)),
-            chunk_id=int(payload.get("chunk_id", 0)),
-            content=str(payload.get("content", "")),
-            score=round(float(hit.score), 4),
-            start_pos=int(payload.get("start_pos", 0)),
-            end_pos=int(payload.get("end_pos", 0)),
-        ))
-
-    # Step 7: Log search
-    try:
-        db.add(SearchLog(
-            query=q,
-            doc_id=doc_id,
-            user_id=user.id,
-            results_count=len(results)
-        ))
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    return SearchResponse(
-        query=q,
-        results=results,
-        total=len(results)
-    )
-</file>
-
-<file path="backend/api/routes_upload.py">
-import os
-import logging
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks
-from sqlalchemy.orm import Session
-from core.deps import get_current_user
-from db.postgres import get_db
-from db.models import Document, User
-from utils.file_utils import validate_file, generate_doc_id, get_file_path
-from services.ingestion_service import process_document
-
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["documents"])
-
-
-@router.post("/upload")
-async def upload_file(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    file_path = None
-    try:
-        contents = await file.read()
-        size = len(contents)
-
-        filename = file.filename
-        if not filename:
-            raise HTTPException(status_code=400, detail="Invalid filename")
-
-        ext = validate_file(filename, size)
-
-        doc_id = generate_doc_id()
-        file_path = get_file_path(doc_id, ext)
-
-        with open(file_path, "wb") as f:
-            f.write(contents)
-
-        document = Document(
-            doc_id=doc_id,
-            filename=filename,
-            file_type=ext,
-            path=file_path,
-            status="pending",
-            user_id=user.id,
-        )
-        db.add(document)
-        db.commit()
-
-        background_tasks.add_task(process_document, doc_id, file_path)
-
-        return {
-            "doc_id": doc_id,
-            "filename": filename,
-            "status": "processing",
-            "message": "File uploaded. Poll /api/document/{doc_id}/status for completion.",
-        }
-
-    except ValueError as e:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(status_code=400, detail=str(e))
-
-    except Exception as e:
-        db.rollback()
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        logger.error(f"Upload failed: {e}")
-        raise HTTPException(status_code=500, detail="Upload failed")
-
-
-#added get_current_user dependency + ownership check
-@router.get("/document/{doc_id}/status")
-def get_document_status(
-    doc_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    document = db.query(Document).filter(
-        Document.doc_id == doc_id,
-        Document.user_id == user.id, 
-    ).first()
-
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    return {
-        "doc_id": document.doc_id,
-        "filename": document.filename,
-        "status": document.status,
-        "total_chunks": document.total_chunks,
-        "created_at": document.created_at,
-    }
-</file>
-
-<file path="backend/core/config.py">
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-class Settings:
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-    QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
-    QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", 6333))
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-
-    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
-
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
-    ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(
-        os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60)
-    )
-
-    EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", 3072))
-    QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "document_chunks")
-
-    def validate(self):
-        """
-        Called once at startup (from main.py lifespan).
-        Raises clearly if a critical key is missing so the developer
-        sees the problem immediately instead of a cryptic 500 later.
-        """
-        missing = []
-        if not self.DATABASE_URL:
-            missing.append("DATABASE_URL")
-        if not self.GEMINI_API_KEY:
-            missing.append("GEMINI_API_KEY")
-        if not self.OPENROUTER_API_KEY:
-            missing.append("OPENROUTER_API_KEY")
-        if not self.SECRET_KEY:
-            missing.append("SECRET_KEY")
-        if missing:
-            raise EnvironmentError(
-                f"Missing required environment variables: {', '.join(missing)}"
-            )
-
-
-settings = Settings()
-</file>
-
 <file path="backend/db/models.py">
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, Index,ForeignKey, UniqueConstraint
 from datetime import datetime, timezone
@@ -2172,6 +1724,91 @@ def chunk_text(text: str, chunk_size: int = 250, overlap: int = 50) -> List[Dict
         chunk_id += 1
 
     return chunks
+</file>
+
+<file path="backend/utils/file_utils.py">
+import os
+import uuid
+import boto3
+from botocore.exceptions import ClientError
+import logging
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_TYPES = ["pdf"]
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def validate_file(filename: str, size: int) -> str:
+    if not filename or "." not in filename:
+        raise ValueError("Invalid filename")
+    ext = filename.rsplit(".", 1)[-1].lower()
+    if ext not in ALLOWED_TYPES:
+        raise ValueError(f"Unsupported file type: .{ext}. Allowed: {ALLOWED_TYPES}")
+    if size > MAX_FILE_SIZE:
+        raise ValueError(f"File size {size} exceeds 10MB limit")
+    return ext
+
+
+def generate_doc_id() -> str:
+    return str(uuid.uuid4())
+
+
+def get_s3_key(doc_id: str, ext: str) -> str:
+    """Returns the S3 object key for a document."""
+    return f"documents/{doc_id}.{ext}"
+
+
+def upload_to_s3(file_bytes: bytes, doc_id: str, ext: str, bucket: str, region: str) -> str:
+    """
+    Upload file bytes to S3. Returns the S3 key on success.
+    """
+    s3_key = get_s3_key(doc_id, ext)
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=s3_key,
+            Body=file_bytes,
+            ContentType="application/pdf",
+        )
+        logger.info(f"Uploaded {s3_key} to s3://{bucket}")
+        return s3_key
+    except ClientError as e:
+        logger.error(f"S3 upload failed: {e}")
+        raise
+
+
+def delete_from_s3(s3_key: str, bucket: str, region: str) -> None:
+    """Delete a file from S3."""
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        s3.delete_object(Bucket=bucket, Key=s3_key)
+        logger.info(f"Deleted {s3_key} from s3://{bucket}")
+    except ClientError as e:
+        logger.error(f"S3 delete failed: {e}")
+
+
+def generate_presigned_url(s3_key: str, bucket: str, region: str, expires: int = 3600) -> str:
+    """Generate a presigned GET URL for a document."""
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": s3_key},
+            ExpiresIn=expires,
+        )
+        return url
+    except ClientError as e:
+        logger.error(f"Presigned URL generation failed: {e}")
+        raise
+
+
+# Legacy local path helper — kept only for local dev fallback
+def get_file_path(doc_id: str, ext: str) -> str:
+    storage_dir = "storage"
+    os.makedirs(storage_dir, exist_ok=True)
+    return os.path.join(storage_dir, f"{doc_id}.{ext}")
 </file>
 
 <file path="backend/vector_store/qdrant_client.py">
@@ -2329,26 +1966,6 @@ def search_vectors(
     )
 
     return cast(List[ScoredPoint], response.points)
-</file>
-
-<file path="backend/requirements.txt">
-fastapi
-uvicorn[standard]
-python-dotenv
-psycopg2-binary
-sqlalchemy
-qdrant-client
-google-genai
-pymupdf
-pytesseract
-Pillow
-python-multipart
-pydantic
-python-dotenv
-openai>=1.0.0
-bcrypt==4.0.1
-passlib[bcrypt]
-python-jose[cryptography]
 </file>
 
 <file path="frontend/src/app/routes.jsx">
@@ -3735,6 +3352,729 @@ const styles = {
 }
 </file>
 
+<file path="frontend/src/features/search/HighlightLayer.jsx">
+import { useEffect, useRef } from "react"
+import { pdfjs } from "react-pdf"
+
+/**
+ * HighlightLayer — canvas-based highlight overlay.
+ *
+ * Strategy:
+ *  1. Always attempt pdfjs page.getTextContent() for coordinate-based highlights.
+ *     This works for text-embedded PDFs perfectly.
+ *
+ *  2. For image/scanned PDFs pdfjs returns 0 text items (no embedded text layer).
+ *     In that case we fall back to checking if the OCR `chunkText` (from search
+ *     results, already extracted by pytesseract on the backend) contains the keyword.
+ *     If yes, we draw a soft highlight banner across the top of the page so the
+ *     user knows this page is a match.
+ *
+ * Props:
+ *   fileProp    — stable { url, httpHeaders } object (memoized in PDFViewer)
+ *   pageNum     — 1-based page number currently shown
+ *   query       — raw search query string
+ *   renderedSize — { width, height } of the rendered PDF canvas in CSS px
+ *   chunkText   — OCR/extracted text for this page from search results (fallback)
+ */
+export default function HighlightLayer({ fileProp, pageNum, query, renderedSize, chunkText }) {
+  const canvasRef = useRef(null)
+
+  useEffect(() => {
+    if (!query || !fileProp?.url || !renderedSize?.width || !renderedSize?.height) return
+
+    // ── Build keyword set from query only ─────────────────────────────────────
+    const stopWords = new Set([
+      "the","a","an","is","are","was","were","be","been","being",
+      "have","has","had","do","does","did","will","would","could",
+      "should","may","might","shall","can","need","dare","ought",
+      "used","to","of","in","on","at","by","for","with","about",
+      "as","into","through","during","before","after","above","below",
+      "from","up","down","out","off","over","under","again","and",
+      "but","or","nor","so","yet","both","either","neither","not",
+      "no","its","it","this","that","these","those","i","you","he",
+      "she","we","they","what","which","who","whom","how","all",
+      "each","few","more","most","other","some","such","than","too",
+      "very","just","also",
+    ])
+
+    const keywords = query
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 1 && !stopWords.has(w))
+
+    if (keywords.length === 0) return
+
+    let cancelled = false
+
+    const drawOnCanvas = (drawFn) => {
+      const canvas = canvasRef.current
+      if (!canvas || cancelled) return
+      canvas.width = renderedSize.width
+      canvas.height = renderedSize.height
+      const ctx = canvas.getContext("2d")
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      drawFn(ctx, canvas.width, canvas.height)
+    }
+
+    const run = async () => {
+      try {
+        // ── Load PDF via pdfjs (browser caches — no re-download) ──────────────
+        const loadingTask = pdfjs.getDocument({
+          url: fileProp.url,
+          httpHeaders: fileProp.httpHeaders || {},
+          withCredentials: false,
+        })
+
+        const pdfDoc = await loadingTask.promise
+        if (cancelled) return
+
+        const page = await pdfDoc.getPage(pageNum)
+        if (cancelled) return
+
+        const naturalViewport = page.getViewport({ scale: 1 })
+        const scaleX = renderedSize.width / naturalViewport.width
+        const scaleY = renderedSize.height / naturalViewport.height
+
+        const textContent = await page.getTextContent()
+        if (cancelled) return
+
+        // ── Check if this page has any embedded text items ────────────────────
+        const hasEmbeddedText = textContent.items.some(
+          (item) => item.str && item.str.trim().length > 0
+        )
+
+        if (hasEmbeddedText) {
+          // ── STRATEGY 1: coordinate-based highlights (text PDFs) ───────────
+          drawOnCanvas((ctx) => {
+            ctx.fillStyle = "rgba(251, 191, 36, 0.50)"
+
+            for (const item of textContent.items) {
+              const str = item.str
+              if (!str || !str.trim()) continue
+
+              const itemClean = str.toLowerCase().replace(/[^a-z0-9\s]/g, " ")
+              const itemWords = itemClean.split(/\s+/).filter(Boolean)
+              const matched = keywords.some((kw) =>
+                itemWords.some((w) => w === kw)
+              )
+              if (!matched) continue
+
+              // transform = [a, b, c, d, tx, ty]
+              // tx,ty = bottom-left origin in PDF coords (Y-axis up)
+              const [, , , fontSizePdf, tx, ty] = item.transform
+
+              const itemW = item.width > 0
+                ? item.width
+                : Math.abs(fontSizePdf) * str.length * 0.55
+              const itemH = item.height > 0
+                ? item.height
+                : Math.abs(fontSizePdf)
+
+              // Flip Y: PDF Y=0 is bottom, canvas Y=0 is top
+              const cx = tx * scaleX
+              const cy = renderedSize.height - (ty * scaleY) - (itemH * scaleY)
+              const cw = itemW * scaleX
+              const ch = itemH * scaleY
+
+              const pad = 1
+              ctx.fillRect(cx - pad, cy - pad, cw + pad * 2, ch + pad * 2)
+            }
+          })
+        } else {
+          // ── STRATEGY 2: image/scanned page — use OCR chunkText fallback ───
+          // Check if the OCR text for this page (from search results) contains
+          // any of the search keywords.
+          const ocrText = (chunkText || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ")
+          const ocrWords = new Set(ocrText.split(/\s+/).filter(Boolean))
+          const ocrMatch = keywords.some((kw) => ocrWords.has(kw))
+
+          if (ocrMatch) {
+            // Draw a labelled banner at the top of the page so user knows
+            // the keyword was found by OCR on this scanned page
+            drawOnCanvas((ctx, w) => {
+              // Semi-transparent amber banner
+              ctx.fillStyle = "rgba(251, 191, 36, 0.20)"
+              ctx.fillRect(0, 0, w, 36)
+
+              // Left accent bar
+              ctx.fillStyle = "rgba(251, 191, 36, 0.85)"
+              ctx.fillRect(0, 0, 4, 36)
+
+              // Label text
+              ctx.fillStyle = "rgba(120, 80, 0, 0.9)"
+              ctx.font = "bold 12px 'Sora', sans-serif"
+              ctx.fillText(`Keyword found via OCR: "${keywords.join(", ")}"`, 12, 23)
+            })
+          }
+        }
+      } catch (err) {
+        if (!cancelled) console.warn("HighlightLayer error:", err)
+      }
+    }
+
+    run()
+
+    return () => {
+      cancelled = true
+      const canvas = canvasRef.current
+      if (canvas) {
+        const ctx = canvas.getContext("2d")
+        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
+      }
+    }
+  // fileProp is memoized in PDFViewer so this won't fire on every render
+  }, [fileProp, pageNum, query, renderedSize, chunkText])
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+        borderRadius: 8,
+        mixBlendMode: "multiply",
+      }}
+      aria-hidden="true"
+    />
+  )
+}
+</file>
+
+<file path="frontend/src/shared/utils/axios.js">
+import axios from "axios"
+
+// With Vite proxy configured, we call /api directly — no env var needed.
+// In production, set VITE_API_URL to your backend domain.
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || "/api",
+})
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("token")
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// Global response error handler — redirect to /login on 401
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem("token")
+      // Only redirect if not already on login page
+      if (!window.location.pathname.includes("/login")) {
+        window.location.href = "/login"
+      }
+    }
+    return Promise.reject(error)
+  }
+)
+
+export default api
+</file>
+
+<file path="frontend/src/main.jsx">
+import { StrictMode } from "react"
+import { createRoot } from "react-dom/client"
+import "react-pdf/dist/Page/AnnotationLayer.css"
+import "react-pdf/dist/Page/TextLayer.css"
+import "./index.css"
+
+import AppRoutes from "./app/routes"
+
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
+    <AppRoutes />
+  </StrictMode>
+)
+</file>
+
+<file path="frontend/index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DocSearch — Semantic Document Intelligence</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+</file>
+
+<file path="backend/api/routes_documents.py">
+import os
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+
+from db.postgres import get_db
+from db.models import Document, Chunk, User
+from core.deps import get_current_user
+from core.config import settings
+from vector_store.qdrant_client import delete_document_vectors
+from utils.file_utils import delete_from_s3, generate_presigned_url
+
+router = APIRouter(prefix="/api", tags=["documents"])
+
+
+@router.get("/documents")
+def list_documents(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    docs = db.query(Document).filter(
+        Document.user_id == user.id
+    ).order_by(Document.created_at.desc()).all()
+
+    return [
+        {
+            "doc_id": str(doc.doc_id),
+            "filename": str(doc.filename),
+            "status": str(doc.status),
+            "total_chunks": getattr(doc, "total_chunks", 0),
+            "created_at": doc.created_at,
+        }
+        for doc in docs
+    ]
+
+
+@router.get("/documents/{doc_id}/view")
+def view_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    doc = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id == user.id,
+    ).first()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    s3_key = str(doc.path)
+
+    # Generate a presigned URL and redirect the browser to it
+    url = generate_presigned_url(
+        s3_key=s3_key,
+        bucket=settings.S3_BUCKET_NAME,
+        region=settings.AWS_REGION,
+        expires=3600,
+    )
+    return RedirectResponse(url=url)
+
+
+@router.delete("/documents/{doc_id}")
+def delete_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    doc = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id == user.id,
+    ).first()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+        db.query(Chunk).filter(Chunk.doc_id == doc_id).delete()
+        delete_document_vectors(doc_id)
+
+        s3_key = str(doc.path)
+        db.delete(doc)
+        db.commit()
+
+        # Delete from S3
+        delete_from_s3(
+            s3_key=s3_key,
+            bucket=settings.S3_BUCKET_NAME,
+            region=settings.AWS_REGION,
+        )
+
+        return {
+            "message": "Document deleted successfully",
+            "doc_id": doc_id,
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+</file>
+
+<file path="backend/api/routes_search.py">
+import logging
+from typing import Optional, List, Dict
+
+from fastapi import APIRouter, HTTPException, Depends, Query
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from db.postgres import get_db
+from db.models import SearchLog, Document, User
+from core.deps import get_current_user
+
+from services.embedding import embed_query
+from vector_store.qdrant_client import search_vectors
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["search"])
+
+# Minimum similarity score — results below this are irrelevant and discarded
+MIN_SCORE = 0.50
+# Maximum number of results shown to the user
+MAX_RESULTS = 5
+
+
+# ---------------------------
+# RESPONSE MODELS
+# ---------------------------
+class SearchResult(BaseModel):
+    doc_id: str
+    filename: str
+    file_url: str
+    page_no: int
+    chunk_id: int
+    content: str
+    score: float
+    start_pos: int
+    end_pos: int
+
+
+class SearchResponse(BaseModel):
+    query: str
+    results: List[SearchResult]
+    total: int
+
+
+# ---------------------------
+# SEARCH API
+# ---------------------------
+@router.get("/search", response_model=SearchResponse)
+def search_documents(
+    q: str = Query(..., min_length=1),
+    doc_id: Optional[str] = Query(None),
+    top_k: int = Query(20, ge=1, le=50),   # fetch more from Qdrant so we have room to filter
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    # Step 1: Get user's documents
+    user_docs = db.query(Document).filter(
+        Document.user_id == user.id
+    ).all()
+
+    allowed_doc_ids = {str(doc.doc_id) for doc in user_docs}
+
+    # Optional: filter by specific doc_id
+    if doc_id:
+        if doc_id not in allowed_doc_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+        allowed_doc_ids = {doc_id}
+
+    # Step 2: Embed query
+    try:
+        query_vector = embed_query(q)
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
+        raise HTTPException(status_code=500, detail="Embedding failed")
+
+    # Step 3: Search vectors — fetch top_k so we have enough after score filtering
+    try:
+        hits = search_vectors(
+            query_vector=query_vector,
+            doc_id=None,
+            top_k=top_k
+        )
+    except Exception as e:
+        logger.error(f"Vector search failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+    # Step 4: Filter hits by user access AND minimum relevance score
+    filtered_hits = [
+        hit for hit in hits
+        if hit.payload
+        and str(hit.payload.get("doc_id")) in allowed_doc_ids
+        and float(hit.score) >= MIN_SCORE
+    ]
+
+    # Step 5: Build doc_map (NO extra DB query)
+    doc_map: Dict[str, str] = {
+        str(doc.doc_id): str(doc.filename)
+        for doc in user_docs
+    }
+
+    # Step 6: Build results, capped at MAX_RESULTS
+    results: List[SearchResult] = []
+
+    for hit in filtered_hits[:MAX_RESULTS]:
+        payload = hit.payload or {}
+        hit_doc_id = str(payload.get("doc_id", ""))
+
+        results.append(SearchResult(
+            doc_id=hit_doc_id,
+            filename=doc_map.get(hit_doc_id, "unknown"),
+            file_url=f"/api/documents/{hit_doc_id}/view",
+            page_no=int(payload.get("page_no", 0)),
+            chunk_id=int(payload.get("chunk_id", 0)),
+            content=str(payload.get("content", "")),
+            score=round(float(hit.score), 4),
+            start_pos=int(payload.get("start_pos", 0)),
+            end_pos=int(payload.get("end_pos", 0)),
+        ))
+
+    # Step 7: Log search
+    try:
+        db.add(SearchLog(
+            query=q,
+            doc_id=doc_id,
+            user_id=user.id,
+            results_count=len(results)
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return SearchResponse(
+        query=q,
+        results=results,
+        total=len(results)
+    )
+</file>
+
+<file path="backend/api/routes_upload.py">
+import os
+import logging
+import tempfile
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks
+from sqlalchemy.orm import Session
+from core.deps import get_current_user
+from core.config import settings
+from db.postgres import get_db
+from db.models import Document, User
+from utils.file_utils import validate_file, generate_doc_id, upload_to_s3, get_s3_key
+from services.ingestion_service import process_document
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["documents"])
+
+
+@router.post("/upload")
+async def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    tmp_path = None
+    doc_id = None
+    try:
+        contents = await file.read()
+        size = len(contents)
+
+        filename = file.filename
+        if not filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        ext = validate_file(filename, size)
+        doc_id = generate_doc_id()
+
+        # Upload to S3
+        s3_key = upload_to_s3(
+            file_bytes=contents,
+            doc_id=doc_id,
+            ext=ext,
+            bucket=settings.S3_BUCKET_NAME,
+            region=settings.AWS_REGION,
+        )
+
+        # Write to a temp file so the background ingestion task can read it
+        # (pdf_parser uses fitz.open which needs a real file path)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+        tmp.write(contents)
+        tmp.close()
+        tmp_path = tmp.name
+
+        document = Document(
+            doc_id=doc_id,
+            filename=filename,
+            file_type=ext,
+            path=s3_key,          # store S3 key in the path column
+            status="pending",
+            user_id=user.id,
+        )
+        db.add(document)
+        db.commit()
+
+        background_tasks.add_task(process_document_and_cleanup, doc_id, tmp_path)
+
+        return {
+            "doc_id": doc_id,
+            "filename": filename,
+            "status": "processing",
+            "message": "File uploaded. Poll /api/document/{doc_id}/status for completion.",
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Upload failed: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+
+def process_document_and_cleanup(doc_id: str, tmp_path: str):
+    """Wrapper that runs ingestion then removes the temp file."""
+    try:
+        process_document(doc_id, tmp_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+@router.get("/document/{doc_id}/status")
+def get_document_status(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    document = db.query(Document).filter(
+        Document.doc_id == doc_id,
+        Document.user_id == user.id,
+    ).first()
+
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "doc_id": document.doc_id,
+        "filename": document.filename,
+        "status": document.status,
+        "total_chunks": document.total_chunks,
+        "created_at": document.created_at,
+    }
+</file>
+
+<file path="backend/core/config.py">
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Settings:
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
+    QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", 6333))
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
+    ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
+    EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", 3072))
+    QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "document_chunks")
+
+    # AWS / S3
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "")
+    AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "")
+
+    def validate(self):
+        missing = []
+        if not self.DATABASE_URL:
+            missing.append("DATABASE_URL")
+        if not self.GEMINI_API_KEY:
+            missing.append("GEMINI_API_KEY")
+        if not self.OPENROUTER_API_KEY:
+            missing.append("OPENROUTER_API_KEY")
+        if not self.SECRET_KEY:
+            missing.append("SECRET_KEY")
+        if not self.S3_BUCKET_NAME:
+            missing.append("S3_BUCKET_NAME")
+        if missing:
+            raise EnvironmentError(
+                f"Missing required environment variables: {', '.join(missing)}"
+            )
+
+
+settings = Settings()
+</file>
+
+<file path="backend/requirements.txt">
+fastapi
+uvicorn[standard]
+python-dotenv
+psycopg2-binary
+sqlalchemy
+qdrant-client
+google-genai
+pymupdf
+pytesseract
+Pillow
+python-multipart
+pydantic
+python-dotenv
+openai>=1.0.0
+bcrypt==4.0.1
+passlib[bcrypt]
+python-jose[cryptography]
+boto3
+</file>
+
+<file path="docker/docker-compose.yml">
+services:
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: fastapi_app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app
+    depends_on:
+      qdrant:
+        condition: service_started
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    env_file:
+      - ../backend/.env
+    restart: always
+
+  qdrant:
+    image: qdrant/qdrant
+    container_name: qdrant_db
+    restart: always
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  qdrant_data:
+</file>
+
 <file path="frontend/src/features/search/PDFViewer.jsx">
 import { Document, Page, pdfjs } from "react-pdf"
 import { useState, useMemo, useRef, useCallback, memo, useEffect } from "react"
@@ -4755,41 +5095,6 @@ const styles = {
 }
 </file>
 
-<file path="frontend/src/shared/utils/axios.js">
-import axios from "axios"
-
-// With Vite proxy configured, we call /api directly — no env var needed.
-// In production, set VITE_API_URL to your backend domain.
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || "/api",
-})
-
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("token")
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
-  }
-  return config
-})
-
-// Global response error handler — redirect to /login on 401
-api.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (error.response?.status === 401) {
-      localStorage.removeItem("token")
-      // Only redirect if not already on login page
-      if (!window.location.pathname.includes("/login")) {
-        window.location.href = "/login"
-      }
-    }
-    return Promise.reject(error)
-  }
-)
-
-export default api
-</file>
-
 <file path="frontend/src/index.css">
 /* @import MUST come before @tailwind directives — PostCSS requirement */
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -4971,38 +5276,6 @@ code, pre, .mono {
 }
 </file>
 
-<file path="frontend/src/main.jsx">
-import { StrictMode } from "react"
-import { createRoot } from "react-dom/client"
-import "react-pdf/dist/Page/AnnotationLayer.css"
-import "react-pdf/dist/Page/TextLayer.css"
-import "./index.css"
-
-import AppRoutes from "./app/routes"
-
-createRoot(document.getElementById("root")).render(
-  <StrictMode>
-    <AppRoutes />
-  </StrictMode>
-)
-</file>
-
-<file path="frontend/index.html">
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DocSearch — Semantic Document Intelligence</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
-</file>
-
 <file path="frontend/vite.config.js">
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -5073,17 +5346,24 @@ app = FastAPI(
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Allow all localhost/127.0.0.1 origins across any port (Vite can be 5173,
 # 5174, 3000, etc.). In production, replace with your real domain.
+# ── CORS ──────────────────────────────────────────────────────────────────────
+allowed_origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+]
+
+# Add the S3 frontend URL from env if set (e.g. http://my-bucket.s3-website.ap-south-1.amazonaws.com)
+if settings.FRONTEND_URL:
+    allowed_origins.append(settings.FRONTEND_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
