@@ -3,7 +3,9 @@ import axios from "axios"
 // With Vite proxy configured, we call /api directly — no env var needed.
 // In production, set VITE_API_URL to your backend domain.
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || "/api",
+  baseURL: import.meta.env.VITE_API_URL
+    ? `${import.meta.env.VITE_API_URL}/api`
+    : "/api",
 })
 
 api.interceptors.request.use((config) => {
