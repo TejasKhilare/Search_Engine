@@ -4,24 +4,23 @@ import { pdfjs } from "react-pdf"
 /**
  * HighlightLayer — canvas-based highlight overlay.
  *
- * Strategy:
- *  1. Always attempt pdfjs page.getTextContent() for coordinate-based highlights.
- *     This works for text-embedded PDFs perfectly.
+ * Works for BOTH text-based AND image/scanned PDFs because it uses
+ * pdfjs page.getTextContent() to get word bounding boxes, then draws
+ * semi-transparent rectangles on a <canvas> positioned exactly over
+ * the rendered PDF page.
  *
- *  2. For image/scanned PDFs pdfjs returns 0 text items (no embedded text layer).
- *     In that case we fall back to checking if the OCR `chunkText` (from search
- *     results, already extracted by pytesseract on the backend) contains the keyword.
- *     If yes, we draw a soft highlight banner across the top of the page so the
- *     user knows this page is a match.
+ * For scanned PDFs the backend already ran OCR (pytesseract) and stored
+ * the text. However react-pdf's text layer may still be absent. This
+ * approach uses pdfjs directly to read whatever text is embedded
+ * (including OCR-injected invisible text layers if present).
  *
  * Props:
- *   fileProp    — stable { url, httpHeaders } object (memoized in PDFViewer)
- *   pageNum     — 1-based page number currently shown
- *   query       — raw search query string
- *   renderedSize — { width, height } of the rendered PDF canvas in CSS px
- *   chunkText   — OCR/extracted text for this page from search results (fallback)
+ *   fileProp     — { url, httpHeaders } same object PDFViewer passes to <Document>
+ *   pageNum      — 1-based page number currently shown
+ *   query        — raw search query string
+ *   renderedSize — { width, height } of the rendered PDF canvas in CSS pixels
  */
-export default function HighlightLayer({ fileProp, pageNum, query, renderedSize, chunkText }) {
+export default function HighlightLayer({ fileProp, pageNum, query, renderedSize }) {
   const canvasRef = useRef(null)
 
   useEffect(() => {
@@ -52,19 +51,9 @@ export default function HighlightLayer({ fileProp, pageNum, query, renderedSize,
 
     let cancelled = false
 
-    const drawOnCanvas = (drawFn) => {
-      const canvas = canvasRef.current
-      if (!canvas || cancelled) return
-      canvas.width = renderedSize.width
-      canvas.height = renderedSize.height
-      const ctx = canvas.getContext("2d")
-      ctx.clearRect(0, 0, canvas.width, canvas.height)
-      drawFn(ctx, canvas.width, canvas.height)
-    }
-
     const run = async () => {
       try {
-        // ── Load PDF via pdfjs (browser caches — no re-download) ──────────────
+        // Load PDF via pdfjs — browser caches it so no re-download
         const loadingTask = pdfjs.getDocument({
           url: fileProp.url,
           httpHeaders: fileProp.httpHeaders || {},
@@ -77,84 +66,59 @@ export default function HighlightLayer({ fileProp, pageNum, query, renderedSize,
         const page = await pdfDoc.getPage(pageNum)
         if (cancelled) return
 
+        // Natural viewport at scale=1 gives us PDF unit dimensions
         const naturalViewport = page.getViewport({ scale: 1 })
+
+        // Scale factors: how many CSS pixels per PDF unit
         const scaleX = renderedSize.width / naturalViewport.width
         const scaleY = renderedSize.height / naturalViewport.height
 
+        // Get text content — works for embedded text AND OCR text layers
         const textContent = await page.getTextContent()
         if (cancelled) return
 
-        // ── Check if this page has any embedded text items ────────────────────
-        const hasEmbeddedText = textContent.items.some(
-          (item) => item.str && item.str.trim().length > 0
-        )
+        const canvas = canvasRef.current
+        if (!canvas) return
 
-        if (hasEmbeddedText) {
-          // ── STRATEGY 1: coordinate-based highlights (text PDFs) ───────────
-          drawOnCanvas((ctx) => {
-            ctx.fillStyle = "rgba(251, 191, 36, 0.50)"
+        // Match canvas resolution to rendered size
+        canvas.width = renderedSize.width
+        canvas.height = renderedSize.height
 
-            for (const item of textContent.items) {
-              const str = item.str
-              if (!str || !str.trim()) continue
+        const ctx = canvas.getContext("2d")
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.fillStyle = "rgba(251, 191, 36, 0.50)"
 
-              const itemClean = str.toLowerCase().replace(/[^a-z0-9\s]/g, " ")
-              const itemWords = itemClean.split(/\s+/).filter(Boolean)
-              const matched = keywords.some((kw) =>
-                itemWords.some((w) => w === kw)
-              )
-              if (!matched) continue
+        for (const item of textContent.items) {
+          const str = item.str
+          if (!str || !str.trim()) continue
 
-              // transform = [a, b, c, d, tx, ty]
-              // tx,ty = bottom-left origin in PDF coords (Y-axis up)
-              const [, , , fontSizePdf, tx, ty] = item.transform
+          // Whole-word keyword match (case-insensitive)
+          const itemClean = str.toLowerCase().replace(/[^a-z0-9\s]/g, " ")
+          const itemWords = itemClean.split(/\s+/).filter(Boolean)
+          const matched = keywords.some((kw) =>
+            itemWords.some((w) => w === kw)
+          )
+          if (!matched) continue
 
-              const itemW = item.width > 0
-                ? item.width
-                : Math.abs(fontSizePdf) * str.length * 0.55
-              const itemH = item.height > 0
-                ? item.height
-                : Math.abs(fontSizePdf)
+          // item.transform = [a, b, c, d, tx, ty]
+          // tx, ty = bottom-left origin in PDF coordinate space (Y axis up)
+          const [, , , fontSizePdf, tx, ty] = item.transform
 
-              // Flip Y: PDF Y=0 is bottom, canvas Y=0 is top
-              const cx = tx * scaleX
-              const cy = renderedSize.height - (ty * scaleY) - (itemH * scaleY)
-              const cw = itemW * scaleX
-              const ch = itemH * scaleY
+          const itemW = item.width > 0 ? item.width : Math.abs(fontSizePdf) * str.length * 0.55
+          const itemH = item.height > 0 ? item.height : Math.abs(fontSizePdf)
 
-              const pad = 1
-              ctx.fillRect(cx - pad, cy - pad, cw + pad * 2, ch + pad * 2)
-            }
-          })
-        } else {
-          // ── STRATEGY 2: image/scanned page — use OCR chunkText fallback ───
-          // Check if the OCR text for this page (from search results) contains
-          // any of the search keywords.
-          const ocrText = (chunkText || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ")
-          const ocrWords = new Set(ocrText.split(/\s+/).filter(Boolean))
-          const ocrMatch = keywords.some((kw) => ocrWords.has(kw))
+          // Convert PDF coords to canvas coords
+          // PDF Y=0 is at bottom; canvas Y=0 is at top → flip
+          const cx = tx * scaleX
+          const cy = renderedSize.height - (ty * scaleY) - (itemH * scaleY)
+          const cw = itemW * scaleX
+          const ch = itemH * scaleY
 
-          if (ocrMatch) {
-            // Draw a labelled banner at the top of the page so user knows
-            // the keyword was found by OCR on this scanned page
-            drawOnCanvas((ctx, w) => {
-              // Semi-transparent amber banner
-              ctx.fillStyle = "rgba(251, 191, 36, 0.20)"
-              ctx.fillRect(0, 0, w, 36)
-
-              // Left accent bar
-              ctx.fillStyle = "rgba(251, 191, 36, 0.85)"
-              ctx.fillRect(0, 0, 4, 36)
-
-              // Label text
-              ctx.fillStyle = "rgba(120, 80, 0, 0.9)"
-              ctx.font = "bold 12px 'Sora', sans-serif"
-              ctx.fillText(`Keyword found via OCR: "${keywords.join(", ")}"`, 12, 23)
-            })
-          }
+          const pad = 1
+          ctx.fillRect(cx - pad, cy - pad, cw + pad * 2, ch + pad * 2)
         }
       } catch (err) {
-        if (!cancelled) console.warn("HighlightLayer error:", err)
+        if (!cancelled) console.warn("HighlightLayer:", err)
       }
     }
 
@@ -168,8 +132,7 @@ export default function HighlightLayer({ fileProp, pageNum, query, renderedSize,
         if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
       }
     }
-  // fileProp is memoized in PDFViewer so this won't fire on every render
-  }, [fileProp, pageNum, query, renderedSize, chunkText])
+  }, [fileProp, pageNum, query, renderedSize])
 
   return (
     <canvas
@@ -178,10 +141,12 @@ export default function HighlightLayer({ fileProp, pageNum, query, renderedSize,
         position: "absolute",
         top: 0,
         left: 0,
+        // Use 100% so it scales with the responsive container
         width: "100%",
         height: "100%",
         pointerEvents: "none",
         borderRadius: 8,
+        // multiply blend: highlight blends with PDF content underneath
         mixBlendMode: "multiply",
       }}
       aria-hidden="true"
