@@ -4,65 +4,71 @@ on:
   push:
     branches: [main]
     paths:
-      - 'backend/**'
-      - 'docker/**'
-      - '.github/workflows/deploy-backend.yml'
+      - "backend/**"
+      - "docker/**"
+      - ".github/workflows/deploy-backend.yml"
+      - ".github/workflows/backend-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false  # never interrupt a deploy half-way
 
 jobs:
+  test:
+    uses: ./.github/workflows/backend-ci.yml
+
   deploy:
+    needs: test  # nothing is deployed unless lint, migrations and tests pass
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          SECRET_KEY: ${{ secrets.SECRET_KEY }}
-          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_CHAT_MODEL: ${{ vars.OPENAI_CHAT_MODEL || 'gpt-4o-mini' }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+          COOKIE_SAMESITE: ${{ vars.COOKIE_SAMESITE || 'lax' }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: DATABASE_URL,GEMINI_API_KEY,OPENROUTER_API_KEY,SECRET_KEY,S3_BUCKET_NAME,AWS_REGION,FRONTEND_URL
+          envs: POSTGRES_PASSWORD,OPENAI_API_KEY,OPENAI_CHAT_MODEL,JWT_SECRET_KEY,MINIO_ACCESS_KEY,MINIO_SECRET_KEY,CORS_ORIGINS,COOKIE_SAMESITE
           script: |
-            set -e
+            set -euo pipefail
 
             echo "==> Pulling latest code"
             cd ~/app
-            git pull origin main
+            git pull --ff-only origin main
 
-            echo "==> Writing .env file"
-            cat > backend/.env << ENVEOF
-            DATABASE_URL=$DATABASE_URL
-            QDRANT_HOST=qdrant
-            QDRANT_PORT=6333
-            GEMINI_API_KEY=$GEMINI_API_KEY
-            OPENROUTER_API_KEY=$OPENROUTER_API_KEY
-            SECRET_KEY=$SECRET_KEY
-            ALGORITHM=HS256
-            ACCESS_TOKEN_EXPIRE_MINUTES=60
-            EMBEDDING_DIM=3072
-            QDRANT_COLLECTION=document_chunks
-            S3_BUCKET_NAME=$S3_BUCKET_NAME
-            AWS_REGION=$AWS_REGION
-            FRONTEND_URL=$FRONTEND_URL
-            ENVEOF
+            echo "==> Writing backend/.env"
+            umask 077
+            {
+              printf '%s\n' "ENVIRONMENT=production" "DEBUG=false" "LOG_LEVEL=INFO"
+              printf '%s\n' "CORS_ORIGINS=$CORS_ORIGINS"
+              printf '%s\n' "POSTGRES_USER=postgres" "POSTGRES_DB=docsearch" "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+              printf '%s\n' "OPENAI_API_KEY=$OPENAI_API_KEY" "OPENAI_CHAT_MODEL=$OPENAI_CHAT_MODEL"
+              printf '%s\n' "OPENAI_EMBEDDING_MODEL=text-embedding-3-small" "EMBEDDING_DIM=1536"
+              printf '%s\n' "JWT_SECRET_KEY=$JWT_SECRET_KEY"
+              printf '%s\n' "COOKIE_SECURE=true" "COOKIE_SAMESITE=$COOKIE_SAMESITE"
+              printf '%s\n' "MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" "MINIO_SECRET_KEY=$MINIO_SECRET_KEY" "MINIO_BUCKET=documents"
+            } > backend/.env
 
-            echo "==> Rebuilding and restarting containers"
-            cd docker
-            docker-compose down
-            docker-compose build --no-cache api
-            docker-compose up -d
+            echo "==> Building and (re)starting the stack"
+            docker compose -f docker/docker-compose.yml --env-file backend/.env up -d --build --remove-orphans
 
-            echo "==> Waiting for health check"
-            sleep 8
-            curl -f http://localhost:8000/ || (docker-compose logs api && exit 1)
-
-            echo "==> Deploy complete"
+            echo "==> Waiting for readiness"
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8000/api/v1/ready > /dev/null; then
+                echo "==> Deploy complete"
+                exit 0
+              fi
+              sleep 2
+            done
+            docker compose -f docker/docker-compose.yml --env-file backend/.env logs --tail 100 api
+            exit 1

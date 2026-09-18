@@ -32,3 +32,9 @@ qdrant_data/
 # Node (future frontend)
 node_modules/
 dist/
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Benchmark datasets (downloaded on demand; results/ is committed)
+backend/benchmarks/data/

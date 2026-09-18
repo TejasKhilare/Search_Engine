@@ -1,34 +1,84 @@
+# Full backend stack: Postgres + pgvector, MinIO, one-shot migrations, API.
+#
+# Run from the repository root:
+#   docker compose -f docker/docker-compose.yml --env-file backend/.env up -d --build
+#
+# Secrets come from backend/.env (same file the app uses locally). Host-side
+# settings in that file (localhost, Windows Tesseract path) are overridden below.
+# Postgres/MinIO are published on non-default host ports (5433, 9010/9011) so they
+# don't clash with a locally installed Postgres or MinIO; remove `ports` in production.
+
+name: docsearch
+
+x-backend: &backend
+  image: docsearch-api:latest
+  env_file:
+    - ../backend/.env
+  environment:
+    POSTGRES_HOST: db
+    POSTGRES_PORT: "5432"
+    MINIO_ENDPOINT: minio:9000
+    MINIO_SECURE: "false"
+    TESSERACT_CMD: ""
+
 services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in backend/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-docsearch}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in backend/.env}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in backend/.env}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9010:9000"
+      - "127.0.0.1:9011:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    <<: *backend
+    build:
+      context: ../backend  # built once here; `api` reuses the same image
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
 
   api:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: fastapi_app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    <<: *backend
+    pull_policy: never  # local image built by `migrate`, never from a registry
+    restart: unless-stopped
     ports:
       - "8000:8000"
-    volumes:
-      - ../backend:/app
     depends_on:
-      qdrant:
-        condition: service_started
-    dns:
-      - 8.8.8.8
-      - 8.8.4.4
-    env_file:
-      - ../backend/.env
-    restart: always
-
-  qdrant:
-    image: qdrant/qdrant
-    container_name: qdrant_db
-    restart: always
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
 
 volumes:
-  qdrant_data:
+  pg_data:
+  minio_data:
