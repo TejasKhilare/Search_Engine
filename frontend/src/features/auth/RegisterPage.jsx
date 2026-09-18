@@ -1,33 +1,42 @@
 import { useState } from "react"
-import { registerUser } from "./api"
-import { useNavigate, Link } from "react-router-dom"
+import { Link } from "react-router-dom"
+import useAuth from "../../hooks/useAuth"
+import { getErrorMessage } from "../../shared/utils/axios"
 import { toast } from "../../shared/utils/toast"
+
+// Mirrors the backend's rules so users get instant feedback
+const USERNAME_RE = /^[A-Za-z0-9_.-]{3,50}$/
+
+function validate({ username, email, password }) {
+  if (!username || !email || !password) return "Please fill in all fields"
+  if (!USERNAME_RE.test(username)) return "Username: 3–50 letters, digits, _ . or -"
+  if (password.length < 8) return "Password must be at least 8 characters"
+  if (!/[A-Za-z]/.test(password) || !/\d/.test(password)) return "Password needs at least one letter and one digit"
+  return null
+}
 
 export default function RegisterPage() {
   const [username, setUsername] = useState("")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [loading, setLoading] = useState(false)
-  const navigate = useNavigate()
+  const { register } = useAuth()
 
   const handleRegister = async () => {
-    if (!username.trim() || !email.trim() || !password.trim()) {
-      toast.error("Please fill in all fields")
-      return
-    }
-    if (password.length < 6) {
-      toast.error("Password must be at least 6 characters")
+    const form = { username: username.trim(), email: email.trim(), password }
+    const problem = validate(form)
+    if (problem) {
+      toast.error(problem)
       return
     }
 
     setLoading(true)
     try {
-      await registerUser({ username, email, password })
-      toast.success("Account created! Please sign in.")
-      navigate("/login")
+      // Registers and signs in; GuestRoute then moves the user into the app
+      await register(form)
+      toast.success("Account created. Welcome!")
     } catch (err) {
-      const msg = err.response?.data?.detail || "Registration failed"
-      toast.error(msg)
+      toast.error(getErrorMessage(err, "Registration failed"))
     } finally {
       setLoading(false)
     }
@@ -85,7 +94,7 @@ export default function RegisterPage() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Min. 6 characters"
+              placeholder="8+ characters, letters and digits"
               style={styles.input}
             />
           </div>

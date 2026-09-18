@@ -1,13 +1,14 @@
 import { useState } from "react"
-import { loginUser } from "./api"
-import { useNavigate, Link } from "react-router-dom"
+import { Link } from "react-router-dom"
+import useAuth from "../../hooks/useAuth"
+import { getErrorMessage } from "../../shared/utils/axios"
 import { toast } from "../../shared/utils/toast"
 
 export default function LoginPage() {
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [loading, setLoading] = useState(false)
-  const navigate = useNavigate()
+  const { login } = useAuth()
 
   const handleLogin = async () => {
     if (!email.trim() || !password.trim()) {
@@ -17,13 +18,11 @@ export default function LoginPage() {
 
     setLoading(true)
     try {
-      const res = await loginUser({ email, password })
-      localStorage.setItem("token", res.access_token)
+      // GuestRoute redirects to the app (or the page they came from) once logged in
+      await login(email.trim(), password)
       toast.success("Welcome back!")
-      navigate("/")
     } catch (err) {
-      const msg = err.response?.data?.detail || "Invalid credentials"
-      toast.error(msg)
+      toast.error(getErrorMessage(err, "Invalid email or password"))
     } finally {
       setLoading(false)
     }

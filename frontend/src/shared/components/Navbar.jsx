@@ -1,15 +1,15 @@
-import { useNavigate, useLocation, Link } from "react-router-dom"
-import { logoutUser } from "../../features/auth/api"
+import { useLocation, Link } from "react-router-dom"
+import useAuth from "../../hooks/useAuth"
 import { toast } from "../utils/toast"
 
 export default function Navbar({ onMenuClick, showMenu }) {
-  const navigate = useNavigate()
   const location = useLocation()
+  const { user, logout } = useAuth()
 
-  const handleLogout = () => {
-    logoutUser()
+  // ProtectedRoute redirects to /login once the session is cleared
+  const handleLogout = async () => {
+    await logout()
     toast.info("Signed out")
-    navigate("/login")
   }
 
   const isActive = (path) => location.pathname === path
@@ -62,6 +62,12 @@ export default function Navbar({ onMenuClick, showMenu }) {
         </Link>
       </div>
 
+      {user && (
+        <span style={styles.userName} title={user.email}>
+          {user.username}
+        </span>
+      )}
+
       {/* Logout */}
       <button onClick={handleLogout} style={styles.logoutBtn}>
         <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
@@ -74,6 +80,15 @@ export default function Navbar({ onMenuClick, showMenu }) {
 }
 
 const styles = {
+  userName: {
+    fontSize: 12,
+    color: "var(--text-secondary)",
+    maxWidth: 140,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    marginRight: 4,
+  },
   nav: {
     height: 56,
     background: "var(--bg-secondary)",
