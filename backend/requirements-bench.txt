@@ -1,0 +1,4 @@
+-r requirements-dev.txt
+
+# Benchmarks only (reading public Parquet embedding datasets)
+pyarrow==25.0.1

@@ -1,0 +1,44 @@
+{
+  "dataset": "scifact",
+  "split": "test",
+  "queries": 300,
+  "chunks": 6160,
+  "k": 10,
+  "results": {
+    "vector": {
+      "recall@10": 0.8618888888888889,
+      "ndcg@10": 0.7164735999353778,
+      "mrr@10": 0.6776124338624339,
+      "p50_ms": 53.090100176632404,
+      "p95_ms": 125.39894008077687
+    },
+    "keyword": {
+      "recall@10": 0.49416666666666664,
+      "ndcg@10": 0.3308210859883643,
+      "mrr@10": 0.28507936507936504,
+      "p50_ms": 245.07135013118386,
+      "p95_ms": 2015.8153805881739
+    },
+    "hybrid": {
+      "recall@10": 0.805,
+      "ndcg@10": 0.6098155871394937,
+      "mrr@10": 0.5568412698412698,
+      "p50_ms": 215.96859954297543,
+      "p95_ms": 2388.619555346668
+    }
+  },
+  "environment": {
+    "date": "2026-09-18",
+    "os": "Windows 10",
+    "cpu": "Intel64 Family 6 Model 142 Stepping 9, GenuineIntel",
+    "cpu_threads": "4",
+    "python": "3.12.5",
+    "embedding_model": "text-embedding-3-small (1536-dim)",
+    "postgres.server_version": "16.4",
+    "postgres.shared_buffers": "128MB",
+    "postgres.work_mem": "4MB",
+    "postgres.maintenance_work_mem": "64MB",
+    "pgvector": "0.8.6",
+    "hnsw_index": "CREATE INDEX ix_chunks_embedding_hnsw ON public.chunks USING hnsw (embedding vector_cosine_ops) WITH (m='16', ef_construction='64')"
+  }
+}

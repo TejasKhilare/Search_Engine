@@ -1,0 +1,123 @@
+{
+  "dataset": "dbpedia-100k",
+  "chunks": 99000,
+  "dimensions": 1536,
+  "k": 10,
+  "queries": 500,
+  "query_source": "500 held-out vectors (not in the index)",
+  "chunks_in_index": 105160,
+  "index_size_mb": 821.5703125,
+  "table_size_mb": 1870.8671875,
+  "index_build_seconds": 269.4696217002347,
+  "exact": {
+    "p50_ms": 1227.0993497222662,
+    "p95_ms": 1712.7840500324965
+  },
+  "sweep": [
+    {
+      "ef_search": 10,
+      "recall": 0.8346,
+      "p50_ms": 7.469050120562315,
+      "p95_ms": 10.90014479123056,
+      "p99_ms": 12.64934768900275,
+      "qps_single": 130.48564608817173
+    },
+    {
+      "ef_search": 20,
+      "recall": 0.9094,
+      "p50_ms": 9.663200005888939,
+      "p95_ms": 13.980285031720996,
+      "p99_ms": 18.659058269113288,
+      "qps_single": 101.40951311062504
+    },
+    {
+      "ef_search": 40,
+      "recall": 0.9556,
+      "p50_ms": 14.578800648450851,
+      "p95_ms": 22.91303537786007,
+      "p99_ms": 26.274006394669414,
+      "qps_single": 67.8838125276968
+    },
+    {
+      "ef_search": 64,
+      "recall": 0.9708,
+      "p50_ms": 17.955549526959658,
+      "p95_ms": 25.586784631013874,
+      "p99_ms": 31.437591174617403,
+      "qps_single": 54.966015083131545
+    },
+    {
+      "ef_search": 100,
+      "recall": 0.9826,
+      "p50_ms": 24.553499650210142,
+      "p95_ms": 34.4837797805667,
+      "p99_ms": 44.231758071109645,
+      "qps_single": 40.38641883165662
+    },
+    {
+      "ef_search": 200,
+      "recall": 0.9922000000000001,
+      "p50_ms": 40.64319981262088,
+      "p95_ms": 58.83919955231249,
+      "p99_ms": 77.10536974482237,
+      "qps_single": 24.372696274553974
+    },
+    {
+      "ef_search": 400,
+      "recall": 1.0,
+      "p50_ms": 1215.4866000637412,
+      "p95_ms": 1782.797324936837,
+      "p99_ms": 2512.7864954620586,
+      "qps_single": 0.7723606093353499
+    }
+  ],
+  "target_recall": 0.95,
+  "operating_point": {
+    "ef_search": 40,
+    "recall": 0.9556,
+    "p50_ms": 14.578800648450851,
+    "p95_ms": 22.91303537786007,
+    "p99_ms": 26.274006394669414,
+    "qps_single": 67.8838125276968
+  },
+  "load": [
+    {
+      "workers": 1,
+      "p50_ms": 13.79820005968213,
+      "p95_ms": 19.11321021616459,
+      "qps": 71.47260774320456
+    },
+    {
+      "workers": 4,
+      "p50_ms": 35.54349998012185,
+      "p95_ms": 56.10724012367427,
+      "qps": 103.76708986556729
+    },
+    {
+      "workers": 8,
+      "p50_ms": 68.97840043529868,
+      "p95_ms": 152.3767047561705,
+      "qps": 105.4940811071112
+    },
+    {
+      "workers": 16,
+      "p50_ms": 133.4019498899579,
+      "p95_ms": 276.91376553848403,
+      "qps": 105.99333820276804
+    }
+  ],
+  "environment": {
+    "date": "2026-09-18",
+    "os": "Windows 10",
+    "cpu": "Intel64 Family 6 Model 142 Stepping 9, GenuineIntel",
+    "cpu_threads": "4",
+    "python": "3.12.5",
+    "embedding_model": "text-embedding-3-small (1536-dim)",
+    "postgres.server_version": "16.4",
+    "postgres.shared_buffers": "128MB",
+    "postgres.work_mem": "4MB",
+    "postgres.maintenance_work_mem": "1900MB",
+    "pgvector": "0.8.6",
+    "hnsw_index": "CREATE INDEX ix_chunks_embedding_hnsw ON public.chunks USING hnsw (embedding vector_cosine_ops) WITH (m='16', ef_construction='64')"
+  }
+}
