@@ -1,9 +1,13 @@
-import { useState, memo, useCallback } from "react"
+import { useState, memo, useCallback, useEffect, useRef } from "react"
 import MainLayout from "../../shared/layout/MainLayout"
 import Sidebar from "../documents/Sidebar"
 import PDFViewer from "./PDFViewer"
+import Snippet from "./Snippet"
+import ScopeChip from "../../shared/components/ScopeChip"
 import useSearch from "../../hooks/useSearch"
 import { searchDocuments } from "./api"
+import { useDocumentStore } from "../../store/documentStore"
+import { getErrorMessage } from "../../shared/utils/axios"
 import { toast } from "../../shared/utils/toast"
 
 const StablePDFViewer = memo(PDFViewer)
@@ -21,9 +25,14 @@ export default function SearchPage() {
   // For mobile: show PDF panel or results panel
   const [mobileView, setMobileView] = useState("results") // "results" | "pdf"
 
-  const handleSearch = useCallback(async () => {
-    const q = query.trim()
-    if (!q) return
+  // Search is scoped to the document selected in the sidebar, if any
+  const scopeId = useDocumentStore((s) => s.selectedDoc?.id ?? null)
+  const abortRef = useRef(null)
+
+  const runSearch = useCallback(async (q, documentId) => {
+    abortRef.current?.abort() // a newer search supersedes any in flight
+    const controller = new AbortController()
+    abortRef.current = controller
 
     resetSearch()
     setLoading(true)
@@ -33,19 +42,36 @@ export default function SearchPage() {
     setMobileView("results")
 
     try {
-      const data = await searchDocuments(q)
+      const data = await searchDocuments(q, { documentId, signal: controller.signal })
       setResults(data.results)
       setSubmittedQuery(q)
       if (data.results.length > 0) {
-        setActiveDocId(data.results[0].doc_id)
-        setActivePage(data.results[0].page_no)
+        setActiveDocId(data.results[0].document_id)
+        setActivePage(data.results[0].page_number)
       }
-    } catch {
-      toast.error("Search failed. Please try again.")
+    } catch (err) {
+      if (controller.signal.aborted) return
+      toast.error(getErrorMessage(err, "Search failed. Please try again."))
     } finally {
-      setLoading(false)
+      if (abortRef.current === controller) setLoading(false)
     }
-  }, [query, resetSearch, setResults])
+  }, [resetSearch, setResults])
+
+  const handleSearch = useCallback(() => {
+    const q = query.trim()
+    if (q) runSearch(q, scopeId)
+  }, [query, scopeId, runSearch])
+
+  // Re-run the last search when the scope changes
+  const lastQueryRef = useRef("")
+  useEffect(() => {
+    lastQueryRef.current = submittedQuery
+  }, [submittedQuery])
+  useEffect(() => {
+    if (lastQueryRef.current) runSearch(lastQueryRef.current, scopeId)
+  }, [scopeId, runSearch])
+
+  useEffect(() => () => abortRef.current?.abort(), [])
 
   const handleKeyDown = useCallback(
     (e) => { if (e.key === "Enter") handleSearch() },
@@ -53,6 +79,8 @@ export default function SearchPage() {
   )
 
   const handleClear = useCallback(() => {
+    abortRef.current?.abort()
+    setLoading(false)
     setQuery("")
     setSubmittedQuery("")
     resetSearch()
@@ -64,8 +92,8 @@ export default function SearchPage() {
 
   // When user clicks a result card — navigate the PDF viewer
   const handleResultClick = useCallback((r) => {
-    setActiveDocId(r.doc_id)
-    setActivePage(r.page_no)
+    setActiveDocId(r.document_id)
+    setActivePage(r.page_number)
     setMobileView("pdf")
   }, [])
 
@@ -106,6 +134,10 @@ export default function SearchPage() {
             >
               {loading ? <span style={styles.spinner} /> : "Search"}
             </button>
+          </div>
+
+          <div style={styles.scopeRow}>
+            <ScopeChip />
           </div>
 
           {searched && !loading && (
@@ -175,11 +207,11 @@ export default function SearchPage() {
                 }}
                 className="results-list-panel"
               >
-                {results.map((r, i) => {
-                  const isActive = activeDocId === r.doc_id && activePage === r.page_no
+                {results.map((r) => {
+                  const isActive = activeDocId === r.document_id && activePage === r.page_number
                   return (
                     <div
-                      key={i}
+                      key={`${r.document_id}-${r.page_number}`}
                       style={{
                         ...styles.resultCard,
                         ...(isActive ? styles.resultCardActive : {}),
@@ -198,13 +230,20 @@ export default function SearchPage() {
                           {r.filename}
                         </div>
                         <div style={styles.resultMeta}>
-                          <span style={styles.pageTag}>p.{r.page_no}</span>
-                          <span style={styles.scoreTag}>{(r.score * 100).toFixed(0)}%</span>
+                          <span style={styles.pageTag}>p.{r.page_number}</span>
+                          <span style={styles.scoreTag} title={`Matched by: ${r.match_types.join(", ")}`}>
+                            {(r.score * 100).toFixed(0)}%
+                          </span>
                         </div>
                       </div>
-                      <p style={styles.resultContent}>
-                        {r.content.slice(0, 200)}{r.content.length > 200 ? "…" : ""}
-                      </p>
+                      <Snippet snippet={r.snippet} style={styles.resultContent} />
+                      {r.match_types.length > 0 && (
+                        <div style={styles.matchTypes}>
+                          {r.match_types.map((t) => (
+                            <span key={t} style={styles.matchType}>{t}</span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )
                 })}
@@ -325,6 +364,12 @@ const styles = {
     fontSize: 11, color: "var(--accent-hover)", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
   },
   resultContent: { fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.6, margin: 0 },
+  matchTypes: { display: "flex", gap: 4, marginTop: 8 },
+  matchType: {
+    fontSize: 10, color: "var(--text-muted)", border: "1px solid var(--border)",
+    borderRadius: 5, padding: "1px 6px", fontFamily: "'JetBrains Mono', monospace",
+  },
+  scopeRow: { marginTop: 8, minWidth: 0 },
   pdfArea: {
     flex: 1, overflow: "auto", padding: "16px", flexDirection: "column",
     minWidth: 0,

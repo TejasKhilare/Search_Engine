@@ -1,59 +1,44 @@
 import { useRef, useState } from "react"
-import { uploadDocument, getDocumentStatus, fetchDocuments } from "./api"
+import { MAX_UPLOAD_MB, uploadDocument } from "./api"
 import { useDocumentStore } from "../../store/documentStore"
+import { getErrorMessage } from "../../shared/utils/axios"
 import { toast } from "../../shared/utils/toast"
 
 export default function UploadButton() {
-  const { setDocuments, updateDocumentStatus } = useDocumentStore()
+  const upsertDocument = useDocumentStore((s) => s.upsertDocument)
   const inputRef = useRef(null)
-  const [uploading, setUploading] = useState(false)
+  const [progress, setProgress] = useState(null) // null = idle, 0–100 while uploading
+  const uploading = progress !== null
 
   const handleUpload = async (e) => {
     const file = e.target.files?.[0]
+    e.target.value = "" // allow picking the same file again
     if (!file) return
 
-    // Reset input so same file can be re-uploaded
-    e.target.value = ""
+    // Fast feedback; the server re-validates the actual content
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      toast.error("Only PDF files are supported")
+      return
+    }
+    if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+      toast.error(`File is larger than ${MAX_UPLOAD_MB} MB`)
+      return
+    }
 
-    setUploading(true)
-
+    setProgress(0)
     try {
-      const res = await uploadDocument(file)
-      const docId = res.doc_id
-
-      toast.info(`Uploading ${file.name}...`)
-
-      // Add optimistically
-      const currentDocs = useDocumentStore.getState().documents
-      setDocuments([
-        { doc_id: docId, filename: file.name, status: "processing", total_chunks: 0 },
-        ...currentDocs,
-      ])
-
-      // Poll for completion
-      const interval = setInterval(async () => {
-        try {
-          const statusRes = await getDocumentStatus(docId)
-          updateDocumentStatus(docId, statusRes.status)
-
-          if (statusRes.status === "completed") {
-            clearInterval(interval)
-            toast.success(`${file.name} processed successfully`)
-            const updatedDocs = await fetchDocuments()
-            setDocuments(updatedDocs)
-          } else if (statusRes.status === "failed") {
-            clearInterval(interval)
-            toast.error(`Processing failed for ${file.name}`)
-          }
-        } catch {
-          clearInterval(interval)
-        }
-      }, 2000)
+      const doc = await uploadDocument(file, setProgress)
+      upsertDocument(doc) // status "pending": the list's poller tracks it from here
+      toast.info(`Processing ${doc.filename}…`)
     } catch (err) {
-      const msg = err.response?.data?.detail || "Upload failed"
-      toast.error(msg)
+      const body = err.response?.data?.error
+      if (err.response?.status === 409 && body?.details?.filename) {
+        toast.info(`Already uploaded as "${body.details.filename}"`)
+      } else {
+        toast.error(getErrorMessage(err, "Upload failed"))
+      }
     } finally {
-      setUploading(false)
+      setProgress(null)
     }
   }
 
@@ -62,7 +47,7 @@ export default function UploadButton() {
       <input
         ref={inputRef}
         type="file"
-        accept=".pdf"
+        accept=".pdf,application/pdf"
         onChange={handleUpload}
         style={{ display: "none" }}
       />
@@ -78,7 +63,7 @@ export default function UploadButton() {
         {uploading ? (
           <>
             <span style={styles.spinner} />
-            Uploading...
+            {progress < 100 ? `Uploading… ${progress}%` : "Validating…"}
           </>
         ) : (
           <>

@@ -1,35 +1,59 @@
 import { useEffect, useState } from "react"
-import { fetchDocuments, deleteDocument } from "./api"
+import { deleteDocument, fetchDocuments, reprocessDocument } from "./api"
 import { useDocumentStore } from "../../store/documentStore"
+import useDocumentPolling from "../../hooks/useDocumentPolling"
+import { getErrorMessage } from "../../shared/utils/axios"
 import { toast } from "../../shared/utils/toast"
 
+const PAGE_SIZE = 50
+
 export default function DocumentList() {
-  const { documents, setDocuments, setSelectedDoc, selectedDoc, removeDocument } =
+  const { documents, total, loaded, selectedDoc, setPage, toggleSelectedDoc, removeDocument, upsertDocument } =
     useDocumentStore()
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(!loaded)
+  const [loadingMore, setLoadingMore] = useState(false)
+
+  useDocumentPolling()
 
   useEffect(() => {
-    const load = async () => {
-      try {
-        const data = await fetchDocuments()
-        setDocuments(data)
-      } catch {
-        toast.error("Failed to load documents")
-      } finally {
-        setLoading(false)
-      }
-    }
-    load()
-  }, [])
+    // Loaded once per session; later changes come from uploads, polling and deletes
+    if (useDocumentStore.getState().loaded) return
+    fetchDocuments({ limit: PAGE_SIZE })
+      .then((page) => setPage(page))
+      .catch((err) => toast.error(getErrorMessage(err, "Failed to load documents")))
+      .finally(() => setLoading(false))
+  }, [setPage])
 
-  const handleDelete = async (e, docId) => {
+  const handleLoadMore = async () => {
+    setLoadingMore(true)
+    try {
+      setPage(await fetchDocuments({ limit: PAGE_SIZE, offset: documents.length }), { append: true })
+    } catch (err) {
+      toast.error(getErrorMessage(err, "Failed to load documents"))
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
+  const handleDelete = async (e, doc) => {
+    e.stopPropagation()
+    if (!window.confirm(`Delete "${doc.filename}"? This cannot be undone.`)) return
+    try {
+      await deleteDocument(doc.id)
+      removeDocument(doc.id)
+      toast.success("Document deleted")
+    } catch (err) {
+      toast.error(getErrorMessage(err, "Delete failed"))
+    }
+  }
+
+  const handleRetry = async (e, doc) => {
     e.stopPropagation()
     try {
-      await deleteDocument(docId)
-      removeDocument(docId)
-      toast.success("Document deleted")
-    } catch {
-      toast.error("Delete failed")
+      upsertDocument(await reprocessDocument(doc.id)) // back to "pending"; polling takes over
+      toast.info(`Reprocessing ${doc.filename}…`)
+    } catch (err) {
+      toast.error(getErrorMessage(err, "Could not reprocess"))
     }
   }
 
@@ -58,15 +82,18 @@ export default function DocumentList() {
   return (
     <div style={styles.list}>
       {documents.map((doc) => {
-        const isSelected = selectedDoc?.doc_id === doc.doc_id
+        const isSelected = selectedDoc?.id === doc.id
+        const canSelect = doc.status === "ready"
         return (
           <div
-            key={doc.doc_id}
+            key={doc.id}
             style={{
               ...styles.item,
               ...(isSelected ? styles.itemSelected : {}),
+              cursor: canSelect ? "pointer" : "default",
             }}
-            onClick={() => setSelectedDoc(doc)}
+            onClick={() => canSelect && toggleSelectedDoc(doc)}
+            title={canSelect ? (isSelected ? "Click to search all documents" : "Click to search only this document") : undefined}
           >
             <div style={styles.docIcon}>
               <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -79,19 +106,27 @@ export default function DocumentList() {
                 {doc.filename}
               </div>
               <div style={styles.docMeta}>
-                <span className={`status-badge status-${doc.status}`}>
+                <span className={`status-badge status-${doc.status}`} title={doc.error_message || undefined}>
                   {doc.status}
                 </span>
-                {doc.total_chunks > 0 && (
-                  <span style={styles.chunks}>{doc.total_chunks} chunks</span>
+                {doc.status === "ready" && (
+                  <span style={styles.chunks}>
+                    {doc.page_count ?? "?"} pages · {doc.chunk_count} chunks
+                  </span>
+                )}
+                {doc.status === "failed" && (
+                  <button onClick={(e) => handleRetry(e, doc)} style={styles.retryBtn} title={doc.error_message || "Retry"}>
+                    ↻ Retry
+                  </button>
                 )}
               </div>
             </div>
 
             <button
-              onClick={(e) => handleDelete(e, doc.doc_id)}
+              onClick={(e) => handleDelete(e, doc)}
               style={styles.deleteBtn}
               title="Delete document"
+              aria-label={`Delete ${doc.filename}`}
             >
               <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
@@ -100,6 +135,12 @@ export default function DocumentList() {
           </div>
         )
       })}
+
+      {documents.length < total && (
+        <button onClick={handleLoadMore} disabled={loadingMore} style={styles.loadMore}>
+          {loadingMore ? "Loading…" : `Load more (${total - documents.length})`}
+        </button>
+      )}
     </div>
   )
 }
@@ -170,6 +211,30 @@ const styles = {
     fontSize: 10,
     color: "var(--text-muted)",
     fontFamily: "'JetBrains Mono', monospace",
+  },
+  retryBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 3,
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    fontSize: 10,
+    fontWeight: 600,
+    color: "var(--accent-hover)",
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  loadMore: {
+    marginTop: 6,
+    padding: "7px 0",
+    background: "transparent",
+    border: "1px solid var(--border)",
+    borderRadius: 8,
+    color: "var(--text-secondary)",
+    fontSize: 12,
+    fontFamily: "inherit",
+    cursor: "pointer",
   },
   deleteBtn: {
     display: "flex",

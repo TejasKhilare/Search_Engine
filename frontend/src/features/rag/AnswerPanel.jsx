@@ -1,5 +1,36 @@
-export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
-  if (!hasSearched) {
+const CITATION_RE = /\[(\d+(?:\s*,\s*\d+)*)\]/g
+
+/** Answer text with every [n] / [n, m] marker turned into a clickable citation. */
+function AnswerText({ answer, sources, onOpenSource }) {
+  const parts = []
+  let last = 0
+  for (const match of answer.matchAll(CITATION_RE)) {
+    if (match.index > last) parts.push(answer.slice(last, match.index))
+    for (const n of match[1].split(",").map((x) => Number(x.trim()))) {
+      const source = sources[n - 1]
+      parts.push(
+        source ? (
+          <button
+            key={`${match.index}-${n}`}
+            className="citation"
+            onClick={() => onOpenSource(source)}
+            title={`${source.filename}, page ${source.page_number}`}
+          >
+            {n}
+          </button>
+        ) : (
+          `[${n}]`
+        )
+      )
+    }
+    last = match.index + match[0].length
+  }
+  if (last < answer.length) parts.push(answer.slice(last))
+  return parts
+}
+
+export default function AnswerPanel({ phase, answer, sources, citations, error, onOpenSource }) {
+  if (phase === "idle") {
     return (
       <div style={styles.emptyState}>
         <div style={styles.emptyIcon}>
@@ -8,7 +39,7 @@ export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
           </svg>
         </div>
         <p style={styles.emptyTitle}>Ask your documents anything</p>
-        <p style={styles.emptyDesc}>Type a question above. The AI will search your documents and provide an answer with source references.</p>
+        <p style={styles.emptyDesc}>Type a question above. The AI answers only from your documents and cites the pages it used. Click a [n] marker to open the source.</p>
         <div style={styles.examples}>
           <p style={styles.examplesLabel}>Example questions:</p>
           {["What are the main findings in this report?", "What skills does the candidate have?", "What is the project timeline and budget?"].map((ex, i) => (
@@ -19,7 +50,7 @@ export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
     )
   }
 
-  if (loading) {
+  if (phase === "retrieving") {
     return (
       <div style={styles.loadingState}>
         <div style={styles.loadingPulse} />
@@ -28,10 +59,12 @@ export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
           <div className="shimmer" style={{ ...styles.loadLine, width: "70%" }} />
           <div className="shimmer" style={{ ...styles.loadLine, width: "80%" }} />
         </div>
-        <p style={styles.loadingText}>Searching documents and generating answer...</p>
+        <p style={styles.loadingText}>Searching your documents…</p>
       </div>
     )
   }
+
+  const cited = new Set(citations)
 
   return (
     <div style={styles.container} className="fade-in">
@@ -45,11 +78,18 @@ export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
             AI Answer
           </div>
         </div>
-        <p style={styles.answerText}>{answer}</p>
+        {phase === "error" && !answer ? (
+          <p style={styles.errorText}>{error}</p>
+        ) : (
+          <p style={styles.answerText} className={phase === "streaming" ? "stream-caret" : undefined}>
+            <AnswerText answer={answer} sources={sources} onOpenSource={onOpenSource} />
+          </p>
+        )}
+        {phase === "error" && answer && <p style={styles.errorText}>{error}</p>}
       </div>
 
       {/* Sources */}
-      {sources && sources.length > 0 && (
+      {sources.length > 0 && (
         <div style={styles.sourcesSection}>
           <h3 style={styles.sourcesTitle}>
             <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -58,24 +98,29 @@ export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
             Sources ({sources.length})
           </h3>
           <div style={styles.sourcesList}>
-            {sources.map((s, i) => (
-              <div key={i} style={styles.sourceCard}>
+            {sources.map((s) => (
+              <button
+                key={s.index}
+                onClick={() => onOpenSource(s)}
+                style={{ ...styles.sourceCard, ...(cited.has(s.index) ? styles.sourceCardCited : {}) }}
+                title="Open this page"
+                data-cited={cited.has(s.index) || undefined}
+              >
                 <div style={styles.sourceHeader}>
                   <div style={styles.sourceFile}>
-                    <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
-                    </svg>
+                    <span style={styles.sourceIndex}>[{s.index}]</span>
                     {s.filename}
                   </div>
                   <div style={styles.sourceTags}>
-                    <span style={styles.pageTag}>p.{s.page_no}</span>
+                    {cited.has(s.index) && <span style={styles.citedTag}>cited</span>}
+                    <span style={styles.pageTag}>p.{s.page_number}</span>
                     <span style={styles.scoreTag}>{(s.score * 100).toFixed(0)}%</span>
                   </div>
                 </div>
                 <p style={styles.sourceExcerpt}>
-                  {s.content.slice(0, 200)}{s.content.length > 200 ? "…" : ""}
+                  {s.content.slice(0, 220)}{s.content.length > 220 ? "…" : ""}
                 </p>
-              </div>
+              </button>
             ))}
           </div>
         </div>
@@ -85,6 +130,29 @@ export default function AnswerPanel({ answer, sources, loading, hasSearched }) {
 }
 
 const styles = {
+  sourceCardCited: {
+    borderColor: "rgba(124,106,247,0.55)",
+    background: "rgba(124,106,247,0.07)",
+  },
+  citedTag: {
+    fontSize: 10,
+    fontWeight: 600,
+    color: "var(--success)",
+    border: "1px solid rgba(34,197,94,0.35)",
+    borderRadius: 5,
+    padding: "1px 6px",
+  },
+  sourceIndex: {
+    color: "var(--accent-hover)",
+    fontWeight: 700,
+    fontFamily: "'JetBrains Mono', monospace",
+    marginRight: 2,
+  },
+  errorText: {
+    margin: "8px 0 0",
+    fontSize: 13,
+    color: "var(--error)",
+  },
   container: {
     display: "flex",
     flexDirection: "column",
@@ -237,6 +305,12 @@ const styles = {
     border: "1px solid var(--border)",
     borderRadius: 12,
     padding: "12px 16px",
+    width: "100%",
+    textAlign: "left",
+    color: "inherit",
+    font: "inherit",
+    cursor: "pointer",
+    transition: "border-color 0.15s",
   },
   sourceHeader: {
     display: "flex",

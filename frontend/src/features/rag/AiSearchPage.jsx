@@ -1,38 +1,32 @@
-import { useState } from "react"
-import { aiSearch } from "./api"
+import { useCallback, useState } from "react"
 import useRag from "../../hooks/useRag"
 import AnswerPanel from "./AnswerPanel"
+import SourcePreviewModal from "./SourcePreviewModal"
 import MainLayout from "../../shared/layout/MainLayout"
+import ScopeChip from "../../shared/components/ScopeChip"
 import Sidebar from "../documents/Sidebar"
-import { toast } from "../../shared/utils/toast"
+import { useDocumentStore } from "../../store/documentStore"
 
 export default function AiSearchPage() {
   const [query, setQuery] = useState("")
-  const { answer, setAnswer, sources, setSources, loading, setLoading, reset } = useRag()
-  const [hasSearched, setHasSearched] = useState(false)
+  const [openSource, setOpenSource] = useState(null)
+  const { phase, busy, question, answer, sources, citations, error, ask, stop } = useRag()
+  const scopeId = useDocumentStore((s) => s.selectedDoc?.id ?? null)
 
-  const handleSearch = async () => {
+  const handleSearch = () => {
     const q = query.trim()
-    if (!q) return
-
-    reset()
-    setLoading(true)
-    setHasSearched(true)
-
-    try {
-      const res = await aiSearch(q)
-      setAnswer(res.answer)
-      setSources(res.sources)
-    } catch (err) {
-      toast.error("AI search failed. Please try again.")
-    } finally {
-      setLoading(false)
-    }
+    if (!q || busy) return
+    ask(q, scopeId ? [scopeId] : null)
   }
 
   const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) handleSearch()
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault()
+      handleSearch()
+    }
   }
+
+  const closePreview = useCallback(() => setOpenSource(null), [])
 
   return (
     <MainLayout sidebar={<Sidebar />}>
@@ -43,7 +37,7 @@ export default function AiSearchPage() {
             <div style={styles.aiDot} />
             <h2 style={styles.title}>AI Ask</h2>
           </div>
-          <p style={styles.subtitle}>Ask questions in natural language — get answers extracted from your documents.</p>
+          <p style={styles.subtitle}>Ask questions in natural language — answers come only from your documents, with page citations.</p>
 
           {/* Search input */}
           <div style={styles.inputRow}>
@@ -55,34 +49,50 @@ export default function AiSearchPage() {
                 placeholder="Ask anything about your documents..."
                 style={styles.textarea}
                 rows={2}
+                maxLength={2000}
               />
             </div>
-            <button
-              onClick={handleSearch}
-              disabled={loading || !query.trim()}
-              style={{
-                ...styles.askBtn,
-                opacity: (loading || !query.trim()) ? 0.6 : 1,
-                cursor: (loading || !query.trim()) ? "not-allowed" : "pointer",
-              }}
-            >
-              {loading ? (
-                <span style={styles.spinner} />
-              ) : (
+            {busy ? (
+              <button onClick={stop} style={{ ...styles.askBtn, background: "var(--bg-hover)" }} title="Stop" aria-label="Stop generating">
+                <span style={styles.stopIcon} />
+              </button>
+            ) : (
+              <button
+                onClick={handleSearch}
+                disabled={!query.trim()}
+                aria-label="Ask"
+                style={{
+                  ...styles.askBtn,
+                  opacity: !query.trim() ? 0.6 : 1,
+                  cursor: !query.trim() ? "not-allowed" : "pointer",
+                }}
+              >
                 <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
                 </svg>
-              )}
-            </button>
+              </button>
+            )}
           </div>
-          <p style={styles.hint}>Press Enter to send · Shift+Enter for new line</p>
+          <div style={styles.metaRow}>
+            <ScopeChip />
+            <p style={styles.hint}>Enter to send · Shift+Enter for new line</p>
+          </div>
         </div>
 
         {/* Answer panel */}
         <div style={styles.answerArea}>
-          <AnswerPanel answer={answer} sources={sources} loading={loading} hasSearched={hasSearched} />
+          <AnswerPanel
+            phase={phase}
+            answer={answer}
+            sources={sources}
+            citations={citations}
+            error={error}
+            onOpenSource={setOpenSource}
+          />
         </div>
       </div>
+
+      {openSource && <SourcePreviewModal source={openSource} query={question} onClose={closePreview} />}
     </MainLayout>
   )
 }
@@ -174,7 +184,23 @@ const styles = {
   hint: {
     fontSize: 11,
     color: "var(--text-muted)",
-    margin: "8px 0 0",
+    margin: 0,
+    flexShrink: 0,
+  },
+  metaRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    marginTop: 8,
+    flexWrap: "wrap",
+    minWidth: 0,
+  },
+  stopIcon: {
+    width: 12,
+    height: 12,
+    borderRadius: 2,
+    background: "var(--text-primary)",
   },
   answerArea: {
     flex: 1,

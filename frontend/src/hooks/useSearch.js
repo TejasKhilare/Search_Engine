@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useCallback, useState } from "react"
 
 export default function useSearch() {
   const [results, setResults] = useState([])
@@ -6,11 +6,12 @@ export default function useSearch() {
   const [activePage, setActivePage] = useState(null)
   const [query, setQuery] = useState("")
 
-  const resetSearch = () => {
+  // Stable identity: callers use it in effect/callback dependency lists
+  const resetSearch = useCallback(() => {
     setResults([])
     setActiveDoc(null)
     setActivePage(null)
-  }
+  }, [])
 
   return {
     results,

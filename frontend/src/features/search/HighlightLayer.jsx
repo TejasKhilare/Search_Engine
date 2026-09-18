@@ -15,7 +15,7 @@ import { pdfjs } from "react-pdf"
  * (including OCR-injected invisible text layers if present).
  *
  * Props:
- *   fileProp     — { url, httpHeaders } same object PDFViewer passes to <Document>
+ *   fileProp     — { url, withCredentials } same object PDFViewer passes to <Document>
  *   pageNum      — 1-based page number currently shown
  *   query        — raw search query string
  *   renderedSize — { width, height } of the rendered PDF canvas in CSS pixels
@@ -50,14 +50,14 @@ export default function HighlightLayer({ fileProp, pageNum, query, renderedSize 
     if (keywords.length === 0) return
 
     let cancelled = false
+    const canvasEl = canvasRef.current // captured for the cleanup below
 
     const run = async () => {
       try {
         // Load PDF via pdfjs — browser caches it so no re-download
         const loadingTask = pdfjs.getDocument({
           url: fileProp.url,
-          httpHeaders: fileProp.httpHeaders || {},
-          withCredentials: false,
+          withCredentials: Boolean(fileProp.withCredentials),
         })
 
         const pdfDoc = await loadingTask.promise
@@ -126,10 +126,9 @@ export default function HighlightLayer({ fileProp, pageNum, query, renderedSize 
 
     return () => {
       cancelled = true
-      const canvas = canvasRef.current
-      if (canvas) {
-        const ctx = canvas.getContext("2d")
-        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
+      if (canvasEl) {
+        const ctx = canvasEl.getContext("2d")
+        if (ctx) ctx.clearRect(0, 0, canvasEl.width, canvasEl.height)
       }
     }
   }, [fileProp, pageNum, query, renderedSize])

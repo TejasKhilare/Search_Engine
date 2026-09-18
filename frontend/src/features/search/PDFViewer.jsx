@@ -3,8 +3,11 @@ import { useState, useMemo, useRef, useCallback, memo, useEffect } from "react"
 import "react-pdf/dist/Page/TextLayer.css"
 import "react-pdf/dist/Page/AnnotationLayer.css"
 import HighlightLayer from "./HighlightLayer"
+import { documentFileUrl } from "../documents/api"
+import { refreshSession } from "../../shared/utils/axios"
 
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`
+// Bundled with the app (no third-party CDN at runtime)
+pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString()
 
 // ─── Hook: watch container width via ResizeObserver ──────────────────────────
 function useContainerWidth(ref) {
@@ -34,38 +37,50 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
   const containerWidth = useContainerWidth(containerRef)
 
   const [numPages, setNumPages] = useState(null)
-  const [pageNum, setPageNum] = useState(docResults[0]?.page_no || 1)
+  const [pageNum, setPageNum] = useState(activePage || docResults[0]?.page_number || 1)
   const [pageReady, setPageReady] = useState(false)
   const [renderedSize, setRenderedSize] = useState(null)
-  const loadedUrlRef = useRef(null)
+  // Bumped to reload the PDF after refreshing an expired session
+  const [attempt, setAttempt] = useState(0)
 
-  const first = docResults[0]
-
-  useEffect(() => {
+  // Jump when the parent selects a different result (state adjusted during
+  // render, the React-recommended alternative to syncing props in an effect)
+  const [prevActivePage, setPrevActivePage] = useState(activePage)
+  if (activePage !== prevActivePage) {
+    setPrevActivePage(activePage)
     if (activePage && activePage !== pageNum) {
       setPageReady(false)
       setRenderedSize(null)
       setPageNum(activePage)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePage])
+  }
 
   const resultPages = useMemo(
-    () => [...new Set(docResults.map((r) => r.page_no))].sort((a, b) => a - b),
+    () => [...new Set(docResults.map((r) => r.page_number))].sort((a, b) => a - b),
     [docResults]
   )
 
-  const handleLoadSuccess = useCallback(
-    ({ numPages: n }) => {
-      setNumPages(n)
-      if (loadedUrlRef.current !== fileProp.url) {
-        loadedUrlRef.current = fileProp.url
-        setPageNum(first.page_no || 1)
+  const handleLoadSuccess = useCallback(({ numPages: n }) => {
+    setNumPages(n)
+    setPageReady(false)
+    setRenderedSize(null)
+  }, [])
+
+  const handleLoadError = useCallback(
+    async (err) => {
+      // The access cookie may have expired while the page sat idle: refresh once and retry
+      if (attempt === 0 && String(err?.status ?? err?.message).includes("401")) {
+        try {
+          await refreshSession()
+          setAttempt(1)
+          return
+        } catch {
+          // fall through to the error message
+        }
       }
-      setPageReady(false)
-      setRenderedSize(null)
+      console.error("PDF load error:", err)
     },
-    [fileProp.url, first.page_no]
+    [attempt]
   )
 
   const handleRenderSuccess = useCallback(() => {
@@ -97,7 +112,7 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
   return (
     <div style={styles.docViewer} ref={containerRef}>
 
-      {resultPages.length > 0 && (
+      {resultPages.length > 1 && (
         <div style={styles.jumpBar}>
           <span style={styles.jumpLabel}>Results on pages:</span>
           {resultPages.map((p) => (
@@ -117,9 +132,10 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
       )}
 
       <Document
+        key={attempt}
         file={fileProp}
         onLoadSuccess={handleLoadSuccess}
-        onLoadError={(err) => console.error("PDF load error:", err)}
+        onLoadError={handleLoadError}
         loading={<div style={styles.msg}>Loading PDF…</div>}
         error={<div style={styles.msg}>Failed to load PDF.</div>}
       >
@@ -176,64 +192,47 @@ function SingleDocViewer({ docResults, query, activePage, fileProp }) {
   )
 }
 
-// ─── Main PDFViewer — groups results by doc, handles multi-doc tabs ───────────
-// ✅ ONLY CHANGE: fetch presigned URL as JSON first to avoid S3 CORS redirect
+// ─── Main PDFViewer — groups results by document, tabs for multiple documents ──
+// `results` items need { document_id, filename, page_number } (search results
+// and AI answer sources both qualify).
 function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp }) {
   const docGroups = useMemo(() => {
     const map = new Map()
     for (const r of results) {
-      if (!map.has(r.doc_id)) {
-        map.set(r.doc_id, { doc_id: r.doc_id, filename: r.filename, file_url: r.file_url, results: [] })
+      if (!map.has(r.document_id)) {
+        map.set(r.document_id, { document_id: r.document_id, filename: r.filename, results: [] })
       }
-      map.get(r.doc_id).results.push(r)
+      map.get(r.document_id).results.push(r)
     }
     return Array.from(map.values())
   }, [results])
 
-  const [activeDocId, setActiveDocId] = useState(() => docGroups[0]?.doc_id ?? null)
-
-  // ✅ NEW: state for fetched presigned URL
-  const [pdfUrl, setPdfUrl] = useState(null)
+  const [activeDocId, setActiveDocId] = useState(() => activeDocIdProp ?? docGroups[0]?.document_id ?? null)
 
   // Reset to first doc whenever results change (new search)
-  const prevResultsRef = useRef(results)
-  if (prevResultsRef.current !== results) {
-    prevResultsRef.current = results
-    const firstId = docGroups[0]?.doc_id ?? null
-    if (firstId !== activeDocId) {
-      setActiveDocId(firstId)
-      setPdfUrl(null)
-    }
+  const [prevResults, setPrevResults] = useState(results)
+  if (prevResults !== results) {
+    setPrevResults(results)
+    setActiveDocId(activeDocIdProp ?? docGroups[0]?.document_id ?? null)
   }
 
-  // Sync when parent drives activeDocId via result card click
-  useEffect(() => {
-    if (activeDocIdProp && activeDocIdProp !== activeDocId) {
-      setActiveDocId(activeDocIdProp)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeDocIdProp])
+  // Follow the parent when it selects a document (e.g. a result card click)
+  const [prevDocIdProp, setPrevDocIdProp] = useState(activeDocIdProp)
+  if (activeDocIdProp !== prevDocIdProp) {
+    setPrevDocIdProp(activeDocIdProp)
+    if (activeDocIdProp) setActiveDocId(activeDocIdProp)
+  }
 
-  // ✅ NEW: fetch presigned URL whenever active doc changes
-  useEffect(() => {
-    if (!activeDocId) return
-    setPdfUrl(null)
-    const token = localStorage.getItem("token")
-    const base = import.meta.env.VITE_API_URL || ""
-    fetch(`${base}/api/documents/${activeDocId}/view`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then((res) => res.json())
-      .then((data) => setPdfUrl(data.url))
-      .catch((err) => console.error("PDF URL fetch failed:", err))
-  }, [activeDocId])
+  // Stable object per document so react-pdf doesn't refetch on every render.
+  // Same-origin in dev (Vite proxy); withCredentials covers a separate API origin.
+  const fileProp = useMemo(
+    () => (activeDocId ? { url: documentFileUrl(activeDocId), withCredentials: true } : null),
+    [activeDocId]
+  )
 
   if (!results || results.length === 0) return null
 
-  const activeGroup = docGroups.find((g) => g.doc_id === activeDocId) ?? docGroups[0]
-
-  // ✅ CHANGED: use fetched presigned URL directly — no auth headers needed
-  const fileProp = pdfUrl ? { url: pdfUrl } : null
+  const activeGroup = docGroups.find((g) => g.document_id === activeDocId) ?? docGroups[0]
 
   return (
     <div style={styles.container}>
@@ -241,14 +240,14 @@ function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp })
         <div style={styles.docTabs}>
           {docGroups.map((g) => (
             <button
-              key={g.doc_id}
-              onClick={() => setActiveDocId(g.doc_id)}
+              key={g.document_id}
+              onClick={() => setActiveDocId(g.document_id)}
               style={{
                 ...styles.docTab,
-                borderBottom: g.doc_id === activeDocId
+                borderBottom: g.document_id === activeDocId
                   ? "2px solid var(--accent)"
                   : "2px solid transparent",
-                color: g.doc_id === activeDocId
+                color: g.document_id === activeDocId
                   ? "var(--accent)"
                   : "var(--text-muted)",
               }}
@@ -264,13 +263,12 @@ function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp })
         </div>
       )}
 
-      {/* ✅ CHANGED: only render when fileProp is ready */}
-      {fileProp && (
+      {fileProp && activeGroup && (
         <SingleDocViewer
-          key={activeGroup.doc_id}
+          key={activeGroup.document_id}
           docResults={activeGroup.results}
           query={query}
-          activePage={activeGroup.doc_id === activeDocId ? activePage : undefined}
+          activePage={activeGroup.document_id === activeDocId ? activePage : undefined}
           fileProp={fileProp}
         />
       )}
@@ -280,7 +278,7 @@ function PDFViewer({ results, query, activePage, activeDocId: activeDocIdProp })
 
 export default memo(PDFViewer)
 
-// ─── Styles — UNCHANGED ───────────────────────────────────────────────────────
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = {
   container: {
     display: "flex",
