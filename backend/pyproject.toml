@@ -1,0 +1,26 @@
+[project]
+name = "docsearch-backend"
+version = "2.0.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "SIM"]
+ignore = ["B008"]  # FastAPI's Depends() in defaults
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]  # asserts and dummy passwords are fine in tests
+# Hybrid search SQL interpolates only constant fragments; all user input is bound
+"app/repositories/search_repository.py" = ["S608"]
+# Benchmarks: seeded sampling and a placeholder hash for a login-less account are intended
+"benchmarks/**" = ["S311", "S106"]
